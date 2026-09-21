@@ -255,6 +255,34 @@ Two measured caveats behind that block, both verified on npm 10.9.7 rather than 
 step that genuinely has a dependency graph — is handled by the compiler rather than a task
 runner.
 
+#### Measured comparison
+
+The same two-workspace project (`apps/api` → express, `apps/web` → react), built both ways
+on npm 10.9.7 / pnpm 10.33.0 / turbo 2.11.2:
+
+| | npm workspaces | pnpm + Turborepo |
+|---|---|---|
+| `apps/api` imports undeclared `react` | **succeeds silently** | `MODULE_NOT_FOUND` |
+| `node_modules` shape | 73 flat entries at root; everything visible to everything | root empty; `apps/api` sees exactly one symlink, `express` |
+| Disk, 3 checkouts of the repo | 29 MB, linear per checkout | 13 MB + 11 MB shared store; marginal checkout ≈ free |
+| Warm install, small tree | 711 ms | 708 ms — no meaningful difference at this size |
+| Task order, `api` depends on `shared` | runs **api first** (declaration order) | runs shared first (`dependsOn: ["^build"]`) |
+| Rebuild with nothing changed | reruns everything, 4.5 s | 15 ms, cache hit |
+| Rebuild after editing `shared` | — | correctly invalidates both shared and api |
+| Per-service Docker image | `npm ci -w apps/api` → 70 pkgs, 4.4 MB | `pnpm deploy --filter` |
+
+Read it as: pnpm's win is **strictness**, not speed or disk, at this size. Turborepo's win is
+**ordering and cache hits**, and it is large — a no-op rebuild goes from 4.5 s to 15 ms.
+
+Two gotchas found while measuring, both worth knowing before adopting:
+
+- Turborepo refuses to start without a `packageManager` (or `devEngines.packageManager`)
+  field in the root `package.json`.
+- **Turborepo caches nothing outside a git repository** — it hashes task inputs via git, and
+  without one it reports `0 cached` on every run with no warning that caching is inert. Easy
+  to mistake for "caching isn't helping" in a fresh scaffold or a container that copied
+  sources without `.git`.
+
 #### Docker: npm prunes per service, natively
 
 The strongest argument for adopting pnpm early is usually Docker. Building four service
