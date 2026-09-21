@@ -1,12 +1,11 @@
 # Shipyard — Work Plan
 
-A Vercel-inspired deployment platform for **static build output**. Point it at a GitHub
-repo; it clones, installs, runs `npm run build`, detects the output directory, uploads the
-artifacts to object storage, and serves them on a wildcard subdomain — for React, Vue,
-Svelte/SvelteKit (static adapter), Next.js (`output: 'export'`), Astro, Nuxt (generate),
-Vite, CRA, Angular, Gatsby, and plain HTML.
+A deployment platform for **static build output**. Connect a GitHub repo; Shipyard builds it
+in a disposable sandbox, works out what directory the build wrote, and serves it on a
+wildcard subdomain — for React, Vue, Svelte/SvelteKit (static adapter), Next.js
+(`output: 'export'`), Astro, Nuxt, Vite, CRA, Angular, Gatsby, and plain HTML.
 
-Status: planning. Nothing in this document is built yet.
+Status: planning. Nothing here is built yet.
 
 ---
 
@@ -17,214 +16,337 @@ Status: planning. Nothing in this document is built yet.
 | Capability | Detail |
 |---|---|
 | Deploy from GitHub | Public repos by URL; private repos via GitHub App |
-| Any npm framework | Auto-detect build command + output dir; manual override |
-| Isolated builds | Each build runs in a throwaway Docker container |
+| Any npm framework | Output directory discovered by observation, not guesswork |
+| Isolated builds | Each build runs in a disposable sandbox, then the sandbox dies |
+| Warm dependency cache | Second build of a project skips most of `npm install` |
 | Live build logs | Streamed to the dashboard over SSE |
 | Immutable deployments | Every build is permanently addressable at its own URL |
-| Aliases & rollback | Promote/rollback = repoint an alias, no rebuild |
+| Instant rollback | Promote/rollback is one row update; no data moves |
 | Preview deployments | Every branch and PR gets its own URL |
 | Auto-deploy on push | GitHub webhook → build |
-| Build-time env vars | Encrypted at rest, injected into the build container |
+| Build-time env vars | Encrypted at rest, injected into the sandbox |
 | Custom domains | CNAME + automatic TLS |
 
-### Explicitly out of scope (v1)
+### Out of scope (v1)
 
-- **SSR / serverless functions.** No Next.js server runtime, no API routes, no edge
-  middleware. The contract is: `npm run build` produces a directory of static files.
-  This single constraint is what makes the whole system tractable — hold the line on it.
-- Non-npm ecosystems (Hugo, Jekyll, Rust/WASM toolchains). Easy to add later; the build
-  container is already generic.
-- Monorepo workspace-aware builds beyond a configurable root directory.
+- **SSR / serverless functions.** No Next.js server runtime, no API routes, no middleware.
+  The contract is: the build emits a directory of static files. This constraint is what
+  makes everything else tractable — hold the line on it.
+- Non-npm toolchains (Hugo, Jekyll, Rust/WASM). The sandbox is generic; add images later.
+- Workspace-aware monorepo builds beyond a configurable root directory.
 - Analytics, team accounts, RBAC, billing.
 
-### Non-goals worth stating out loud
+### The thing to keep in mind throughout
 
 You are running **arbitrary untrusted code from the internet** on your infrastructure.
-Everything in §3.2 exists because of that. A build pipeline that shells out to
-`npm install && npm run build` on the host is remote code execution as a service. Do not
-ship that, even to yourself, even "just for the demo."
+Every isolation decision in §4 follows from that. A pipeline that shells out to
+`npm install && npm run build` on a host is remote code execution as a service — not a
+shortcut to clean up later.
 
 ---
 
-## 2. Architecture
+## 2. Why this isn't Deploy_X's architecture
+
+[Deploy_X](https://github.com/bharath200415/Deploy_X) is a clear, working demonstration of
+the pipeline, and reading it is the fastest way to understand the problem space. But its
+shape — *API clones → uploads every source file to S3 → Redis queue → worker downloads every
+file → builds on the host → uploads output → router does an S3 GET per request* — has four
+structural problems. They aren't polish items; each one changes what you build.
+
+### 2.1 The source round-trip through object storage is pure overhead
+
+Deploy_X clones the repo in `uploadService`, walks the tree, and issues one `PutObject` per
+file. The worker then issues one `GetObject` per file to reconstruct it. A mid-sized repo is
+thousands of round trips in each direction, and it dominates deploy latency.
+
+**Better: the builder clones the repo itself.** Git is already a delta-compressed transfer
+protocol built for exactly this. A shallow single-branch clone of a typical frontend repo is
+one connection and a couple of seconds.
+
+The only reason to stage through storage would be if the API held credentials the builder
+didn't — and that's solved by minting a short-lived GitHub App installation token at build
+start and passing it to the sandbox. **This deletes an entire service** and the slowest
+segment of the pipeline.
+
+### 2.2 Prefix-copy storage makes rollback expensive and dedup impossible
+
+Deploy_X writes build output to `dist/<id>/...` — a fresh full copy of every file, per
+deployment. Redeploy a site after a one-word README change and you've stored a second
+complete copy of every asset. There's no way to roll back except by rebuilding, and no way
+to tell that 98% of the new deployment is byte-identical to the old one.
+
+**Better: a content-addressed store.** Hash every output file; store the bytes once at
+`blobs/<sha256>`; store a per-deployment `manifest.json` mapping path → hash. Uploading a
+deployment means `HEAD`-ing the hashes and uploading only the misses — in practice 2–5% of
+files on a rebuild. A deployment *is* its manifest, so rollback is repointing a pointer and
+moves zero bytes.
+
+This also makes the edge cache trivially correct, which is the next problem.
+
+### 2.3 An S3 GET per request is the wrong hot path
+
+Deploy_X's `reqHandler` does an `s3.getObject` on every single request and buffers the whole
+body into memory before responding. A page loading 30 assets is 30 round trips to object
+storage, each 50–200ms, on every visit by every visitor. It also means a 40MB file is a 40MB
+allocation per concurrent request.
+
+**Better: because blobs are content-addressed and immutable, the edge can cache them on
+local disk forever with no invalidation logic at all.** First request for a hash fetches and
+stores it; every subsequent request across every deployment that references that hash is a
+local read. Manifests are small JSON and live in memory. Responses stream.
+
+"Immutable content means the cache is always right" is the property worth designing for, and
+you only get it if you choose content addressing in §2.2.
+
+### 2.4 `spawn('npm', ..., { shell: true })` on the worker host is RCE
+
+Deploy_X's `buildProject` spawns the install and build directly on the worker, with a shell,
+as whatever user the worker runs as, with no limits. Any repo you deploy — or anyone who can
+submit a URL — gets code execution on that machine, with its environment variables and its
+storage credentials.
+
+This is the one difference that isn't a performance argument. §4 covers the replacement.
+
+### 2.5 One more, smaller: the object key is built from user input
+
+The object key is built as `dist/<id>` + `req.path`, concatenating a request path straight into a storage key, so
+`GET /../../other-id/index.html` reads another tenant's deployment. Noted here because a
+content-addressed edge sidesteps the whole class: the edge never builds a key from a request
+path, it looks the path up in a manifest and uses the hash it finds. Paths that aren't in the
+manifest simply don't resolve.
+
+---
+
+## 3. Architecture
 
 ```mermaid
 flowchart TB
-    Dev[Developer] -->|GitHub OAuth, create project| Web[Web Dashboard<br/>React + Vite]
+    Dev[Developer] -->|OAuth, create project| Web[Web Dashboard<br/>React + Vite]
     GH[GitHub] -->|push webhook| API
-    Web -->|REST + SSE| API[API Service<br/>Express + Prisma]
+    Web -->|REST + SSE| API[Control Plane<br/>Express + Prisma]
 
-    API --> PG[(Postgres<br/>projects, deployments,<br/>aliases, domains, env)]
-    API -->|enqueue build| Q[(Redis<br/>BullMQ + log pub/sub)]
-    API -->|clone + tar + upload| S3[(Object Storage<br/>R2 / S3 / MinIO)]
+    API --> PG[(Postgres<br/>projects, deployments, aliases,<br/>blobs, job queue, log pub/sub)]
 
-    Q -->|consume| W[Build Worker]
-    W -->|download source tarball| S3
-    W -->|docker run --rm| C[Build Container<br/>node:22-slim, no caps,<br/>cpu/mem/pid/time limits]
-    C -->|stdout/stderr| W
-    W -->|publish log lines| Q
-    W -->|upload build output| S3
-    W -->|update status| PG
+    API -->|claim job<br/>SKIP LOCKED| BD[Build Dispatcher]
+    BD -->|create sandbox| SB[Disposable Sandbox<br/>clone, install, build]
+    SB -->|git clone --depth 1| GH
+    SB -->|restore/save dep cache| ST[(Object Storage<br/>R2 / S3 / MinIO)]
+    SB -->|upload new blobs only| ST
+    SB -->|log lines| BD
+    BD -->|NOTIFY logs| PG
 
-    User[Visitor] -->|"*.shipyard.app / custom domain"| Edge[Edge Router<br/>Express + Caddy TLS]
-    Edge -->|host to deployment lookup| Q
-    Edge -->|stream objects| S3
+    User[Visitor] -->|"*.shipyard.app / custom domain"| Edge[Edge<br/>manifest + blob cache]
+    Edge -->|host to manifest<br/>in-memory| PG
+    Edge -->|blob on cache miss| ST
+    Edge -.->|local disk LRU<br/>keyed by sha256| Edge
 ```
 
 ### Services
 
-| Service | Responsibility | Why separate |
+| Service | Responsibility | Notes |
 |---|---|---|
-| `web` | Dashboard SPA | Static; deploys on Shipyard itself once it works |
-| `api` | Auth, projects, deployments, webhooks, log SSE, source ingest | The only thing users' browsers talk to |
-| `worker` | Consumes build jobs, drives Docker, uploads artifacts | Scales horizontally; lives on hosts you're willing to see compromised |
-| `edge` | Resolves hostname → deployment, streams files, caching | Different scaling profile (read-heavy, latency-sensitive) and must stay up while builds fail |
+| `web` | Dashboard SPA | Static; deploys on Shipyard once it works |
+| `api` | Auth, projects, deployments, webhooks, SSE, aliases | Only thing browsers talk to |
+| `dispatcher` | Claims build jobs, creates/destroys sandboxes, relays logs | Thin. Holds a sandbox-API token, never a Docker socket |
+| `edge` | Hostname → manifest → blob; caching, streaming | Read-heavy; must stay up while builds fail |
 
-**Do not merge `worker` into `api`.** The worker needs Docker daemon access, which is
-root-equivalent. Keeping it on its own machine is the entire security boundary.
+Note what's *absent* relative to Deploy_X: there is no upload service, because nothing stages
+source through storage (§2.1).
+
+And note that `dispatcher` is deliberately thin. Deploy_X's worker *is* the build environment;
+here the dispatcher only orchestrates one, so the process that touches untrusted code and the
+process that holds credentials are different processes on different machines.
 
 ### Stack
 
 - **Frontend:** React 19, Vite, TypeScript, Tailwind, shadcn/ui, TanStack Query, React Router
-- **Backend:** Node 22, Express 5, TypeScript, Zod (validate every boundary), Prisma
-- **Data:** Postgres (durable state), Redis (queue + log fan-out + hostname cache)
-- **Queue:** BullMQ — retries, backoff, concurrency limits, dead-letter, job TTL. Raw
-  `brPop` loops lose jobs when a worker dies mid-build; do not hand-roll this.
-- **Builds:** Docker via `dockerode`
+- **Backend:** Node 22, Express 5, TypeScript, Zod at every boundary, Prisma
+- **Data:** Postgres. See §3.1 — **no Redis in v1**.
+- **Sandbox:** pluggable driver; local Docker in dev, Fly Machines or Kubernetes Jobs in prod (§4)
 - **Storage:** S3-compatible — MinIO locally, Cloudflare R2 in production (zero egress fees,
-  which matters a lot when you're serving static assets)
-- **Edge TLS:** Caddy in front of `edge`, on-demand TLS for custom domains
-- **Repo:** pnpm workspaces + Turborepo monorepo
+  which matters when the workload is serving static assets)
+- **Edge TLS:** Caddy with on-demand TLS for custom domains
+- **Repo:** pnpm workspaces + Turborepo
+
+### 3.1 Postgres only — skip Redis until it's earned
+
+Deploy_X uses Redis for the queue (`brPop`), status (`hSet`), and logs (`rPush`). That's
+three jobs, and Postgres does all three well enough that a second datastore isn't worth its
+operational cost at this stage:
+
+- **Queue:** `SELECT ... FOR UPDATE SKIP LOCKED` is a correct, well-understood job queue with
+  transactional claim semantics. Deploy_X's `brPop` loop has a real failure mode it doesn't
+  handle: if a worker dies mid-build, the job is gone — it was popped and never acknowledged.
+  A `SKIP LOCKED` claim with a lease and a visibility timeout recovers automatically.
+- **Live logs:** `LISTEN`/`NOTIFY` fans out to SSE connections.
+- **Status:** it's a column.
+
+Add Redis when you can name the measurement that demands it (queue throughput or SSE fan-out
+past what one Postgres handles). Starting with one datastore instead of two is one less thing
+to run, back up, and reason about during M1–M4.
+
+### 3.2 Storage layout
+
+```
+blobs/<sha256>                    # file content, deduplicated, immutable, forever
+blobs/<sha256>.br                 # brotli-precompressed variant, written at upload time
+depcache/<lockfileHash>.tar.zst   # warm node_modules / package-manager store
+logs/<deploymentId>.log           # build log, flushed once at completion
+```
+
+Manifests live in Postgres (`Deployment.manifest` as `jsonb`) rather than storage — they're
+small, the edge queries them constantly, and having them transactional with the alias update
+is what makes promotion atomic.
+
+No source is stored at all. The commit SHA is the source of truth; a rebuild re-clones.
 
 ---
 
-## 3. The four problems that actually matter
+## 4. Build isolation
 
-Everything else is CRUD. These are the parts to get right.
+The build step runs untrusted code. Two things follow: the environment must be disposable,
+and the process that creates it must not be the process that holds your credentials.
 
-### 3.1 Finding the build output directory
+### 4.1 A driver interface, chosen per environment
 
-`dist` is not a safe assumption. The resolution order:
+```ts
+interface SandboxDriver {
+  run(spec: BuildSpec): AsyncIterable<LogLine>;  // resolves when the sandbox has exited
+  cancel(handle: string): Promise<void>;
+}
+```
 
-1. **Explicit project setting.** User-configured output directory always wins.
-2. **`shipyard.json` in the repo** (optional): `{ "buildCommand", "outputDirectory", "installCommand", "rootDirectory", "nodeVersion" }`.
-3. **Framework detection** from `package.json` dependencies and config files:
+| Driver | Use | Isolation |
+|---|---|---|
+| `LocalDockerDriver` | Local dev only | Container. Requires a Docker socket — acceptable on your laptop, never in prod |
+| `FlyMachineDriver` | **Recommended for production** | Firecracker microVM per build. Hardware-virtualized, created by API call, per-second billing, no cluster to operate |
+| `K8sJobDriver` | If you already run Kubernetes | A Job per build with the gVisor `RuntimeClass`; scheduling, limits, and cleanup come free |
 
-   | Detected | Build command | Output |
-   |---|---|---|
-   | `next` | `next build` | `out` — **requires `output: 'export'`** |
-   | `nuxt` | `nuxt generate` | `.output/public` |
-   | `@sveltejs/kit` | `vite build` | `build` — **requires `adapter-static`** |
-   | `astro` | `astro build` | `dist` |
-   | `@angular/cli` | `ng build` | `dist/<project>/browser` |
-   | `gatsby` | `gatsby build` | `public` |
-   | `react-scripts` (CRA) | `react-scripts build` | `build` |
-   | `@vue/cli-service` | `vue-cli-service build` | `dist` |
-   | `@remix-run/*` (SPA mode) | `remix vite:build` | `build/client` |
-   | `vite` (React/Vue/Svelte/Solid/Qwik) | `vite build` | `dist` |
-   | no `package.json` | — | repo root, served as-is |
+The recommendation is **Fly Machines**. A microVM is a genuinely stronger boundary than a
+container — container escapes are a recurring class of CVE, and a kernel exploit inside a
+Firecracker VM gets you a VM. Operationally it's an HTTP call to create, one to destroy, and
+nothing running between builds, which for a solo-operated platform beats maintaining a pool
+of privileged Docker hosts.
 
-4. **Post-build heuristic fallback.** Record directory mtimes before the build. After it,
-   pick the first of `dist`, `build`, `out`, `public`, `.output/public`, `_site` that
-   (a) exists, (b) contains an `index.html`, and (c) was created or modified during the
-   build. This catches the long tail of custom configs, and it's more reliable than
-   detection alone.
+Keep `LocalDockerDriver` honest about what it is: dev-only, and the plan says so in code.
 
-If nothing is found, **fail loudly with a log line telling the user to set the output
-directory**. Never silently deploy the repo root.
+### 4.2 Limits, on every driver
 
-**Two framework-specific traps to surface in the UI as an actionable error, not a stack trace:**
-- Next.js without `output: 'export'` produces `.next`, not `out`. Detect `.next` with no
-  `out` and say exactly that.
-- SvelteKit with the default `adapter-auto` fails or emits a server bundle. Detect and say so.
+Enforced by the sandbox where possible and by the dispatcher regardless:
+
+```
+non-root user                 memory 2g, no swap        cpus 2
+read-only rootfs              pids 512                  no nested socket/API access
+writable: /workspace, /tmp    wall-clock timeout 10m    output cap 500 MB
+                              log-line cap 50k
+```
+
+Two deliberate calls:
+
+- **Network stays on during install.** `npm install` needs the registry. Isolation is the
+  sandbox, not the network. Hardening step later: an egress proxy allowing only the registry
+  and GitHub.
+- **Do not pass `--ignore-scripts`.** It breaks `esbuild`, `sharp`, `@swc/core`, Playwright —
+  most real builds. Postinstall scripts are precisely the untrusted code the sandbox exists
+  to contain; blocking them trades a working product for security theatre.
+
+### 4.3 Credentials
+
+The sandbox gets: the repo's short-lived installation token, the project's decrypted env
+vars, and **an upload token scoped to writing blobs for this one deployment**. It never gets
+database access, long-lived storage credentials, or the dispatcher's sandbox-API token.
+
+### 4.4 The dependency cache
+
+This is a day-one feature, not a stretch goal, because it's the difference between a
+90-second build and a 20-second one — the single largest factor in how the product feels.
+
+Key on `sha256(lockfile + node version + package manager)`. Restore `depcache/<key>.tar.zst`
+into the workspace before install; on a hit, `npm ci` becomes a near-no-op. Save the archive
+after a successful install on a miss. Content-keyed, so it's never stale — a lockfile change
+is a different key.
+
+---
+
+## 5. Discovering the output directory
+
+`dist` is not a safe assumption across the target frameworks. Deploy_X hardcodes it, then
+falls back to uploading the entire repo when there's no `package.json`.
+
+**Invert the usual approach: don't predict where the build writes, observe it.**
+
+1. Snapshot the workspace tree before the build.
+2. Run the build.
+3. Find every `index.html` created or modified during the build window.
+4. Take the shallowest such directory that is not the workspace root.
+
+This handles custom `outDir` configs, frameworks released after you wrote the code, and the
+long tail — without a detection table having to be right.
+
+**Framework detection still exists, but for two narrower jobs:**
+
+- **Choosing a build command** when `package.json` has no `build` script.
+- **Producing good errors.** This is where it earns its keep:
+
+  | Symptom | Message to show |
+  |---|---|
+  | `next` present, `.next` written, no `out` | "Next.js needs `output: 'export'` in `next.config.js` to produce a static site." |
+  | `@sveltejs/kit` with `adapter-auto` | "SvelteKit needs `@sveltejs/adapter-static`." |
+  | Build succeeded, no `index.html` anywhere | "Build produced no `index.html`. Set the output directory in project settings." |
+  | Server bundle detected (`server/`, `.output/server`) | "This looks like an SSR build. Shipyard serves static output only." |
+
+  Reference table for command selection: `next build`→`out`, `nuxt generate`→`.output/public`,
+  SvelteKit→`build`, `astro build`→`dist`, `ng build`→`dist/<project>/browser`,
+  `gatsby build`→`public`, `react-scripts build`→`build`, Vite→`dist`, no `package.json`→root.
 
 **Package manager** comes from the lockfile: `pnpm-lock.yaml` → `pnpm install --frozen-lockfile`,
 `yarn.lock` → `yarn install --immutable`, `bun.lockb` → `bun install --frozen-lockfile`,
-otherwise `npm ci` (falling back to `npm install` when there's no lockfile).
+else `npm ci` (or `npm install` with no lockfile).
 
-### 3.2 Build isolation
-
-Every build runs as `docker run --rm` with:
-
-```
---user 1000:1000                 # never root
---read-only                      # rootfs immutable
---tmpfs /tmp:size=512m
--v <build-dir>:/workspace        # the only writable path
---memory 2g --memory-swap 2g
---cpus 2
---pids-limit 512
---security-opt no-new-privileges
---cap-drop ALL
-```
-
-Plus, enforced by the worker: a **hard wall-clock timeout** (10 min default) that kills the
-container, a **log-line cap** (say 50k lines) so a runaway build can't fill Redis, and an
-**output size cap** (say 500 MB) checked before upload.
-
-Deliberate decisions:
-
-- **Network stays on during install.** `npm install` needs the registry. The isolation story
-  is the container, not the network. A hardening step later is an egress proxy that only
-  allows the registry and GitHub.
-- **Do not pass `--ignore-scripts`.** It breaks `esbuild`, `sharp`, `@swc/core`, Playwright
-  and more — most real builds. Postinstall scripts are exactly the untrusted code the
-  container exists to contain.
-- **Never mount `/var/run/docker.sock` into the build container.** That is a one-line
-  container escape to host root.
-- The worker itself holds Docker access, so treat worker hosts as untrusted: no production
-  credentials in their environment beyond a **scoped, write-only-to-its-own-prefix** storage
-  token, separate VPC/subnet, no database access.
-- Later hardening: swap the runtime for **gVisor (`runsc`)** or **Firecracker** microVMs.
-  Design the worker so the runtime is one config value.
-
-### 3.3 Immutable deployments and atomic promotion
-
-This is the design idea that separates a real platform from a toy, and it costs almost
-nothing to build in from day one.
-
-- Every build uploads to `sites/<deploymentId>/...` and is **never mutated again**.
-- An `aliases` table maps hostname → deploymentId:
-  - `<project>.shipyard.app` → current production deployment
-  - `<project>-git-<branch>.shipyard.app` → latest build of that branch
-  - `<deploymentId>.shipyard.app` → that build, forever
-  - `www.customer.com` → current production deployment
-- **Promote** = update one row. **Rollback** = point the row at an older deployment.
-  Both are instant, atomic, and require no rebuild.
-- The edge resolves hostname → deploymentId from a **Redis cache** (`alias:<host>`), with
-  Postgres as the source of truth on a cache miss. Alias writes invalidate the key.
-
-Without this you end up overwriting a live directory in-place during upload, which means
-visitors see a half-deployed site, and rollback means rebuilding an old commit.
-
-### 3.4 The edge router
-
-The reference implementation builds its object key as `dist/<id>` + `req.path` — concatenating a
-user-controlled path into an object key. `GET /../../other-id/index.html` reads another
-tenant's files. Get this right:
-
-```ts
-const rel = path.posix.normalize(decodeURIComponent(reqPath));
-if (rel.includes('..') || rel.includes('\0')) return res.sendStatus(400);
-const key = `sites/${deploymentId}${rel.startsWith('/') ? rel : '/' + rel}`;
-```
-
-Also required:
-- **Stream** the S3 body to the response. Don't `res.send(buffer)` — a 40 MB video buffers
-  entirely into memory per request.
-- **Caching:** content-hashed assets (`/assets/*`, `/_next/static/*`) get
-  `Cache-Control: public, max-age=31536000, immutable`; `*.html` gets `no-cache`. Since
-  deployments are immutable, the aggressive caching is always safe.
-- **Conditional GETs:** pass through S3's `ETag` and honor `If-None-Match` → `304`.
-- **Directory URLs:** `/about` → try `/about.html`, then `/about/index.html`.
-- **SPA fallback:** on 404, serve `/index.html` with **status 200** (per-project toggle —
-  wrong for a static blog, essential for client-side routing).
-- **Range requests** for media.
-- Security headers, and a per-deployment `_headers`/`_redirects` file parser as a stretch goal.
+Explicit project settings and an optional `shipyard.json` (`buildCommand`, `outputDirectory`,
+`installCommand`, `rootDirectory`, `nodeVersion`) override everything above.
 
 ---
 
-## 4. Data model
+## 6. The edge
+
+Resolution per request:
+
+1. `hostname` → `deploymentId` — in-memory LRU, Postgres on miss, invalidated on alias write.
+2. `deploymentId` → manifest — in-memory; manifests are small and immutable.
+3. `path` → `{sha256, size, contentType}` — a map lookup. **A path not in the manifest cannot
+   resolve to anything**, which is what retires §2.5's traversal bug by construction.
+4. `sha256` → bytes — local disk LRU, object storage on miss. Immutable, so a hit is always
+   valid and there is no invalidation path to get wrong.
+
+Then:
+
+- **Stream** the body. Never buffer a whole file per request.
+- `Cache-Control: public, max-age=31536000, immutable` for hashed assets; `no-cache` for HTML.
+  Always safe, because deployments are immutable.
+- `ETag` is the blob's sha256 — free, exact, and stable across deployments. Honor
+  `If-None-Match` → `304`.
+- Serve the `.br` variant when `Accept-Encoding` permits.
+- Directory URLs: `/about` → `/about.html` → `/about/index.html`.
+- SPA fallback: unresolved path → `/index.html` at **status 200**, per-project toggle (wrong
+  for a static blog, essential for client-side routing).
+- Range requests for media.
+
+### Promotion and rollback
+
+An `Alias` row maps hostname → deployment:
+
+- `<project>.shipyard.app` → current production
+- `<project>-git-<branch>.shipyard.app` → latest build of that branch
+- `<deploymentId>.shipyard.app` → that build, permanently
+- `www.customer.com` → current production
+
+Promote and rollback are both a single `UPDATE` plus a cache invalidation. No rebuild, no
+copy, instant, and reversible — which only works because §2.2 made a deployment a pointer.
+
+---
+
+## 7. Data model
 
 ```prisma
 model User        { id, githubId, login, email, avatarUrl, createdAt }
@@ -232,175 +354,176 @@ model Project     { id, userId, name, repoFullName, repoId, defaultBranch,
                     rootDirectory, installCommand?, buildCommand?, outputDirectory?,
                     nodeVersion, spaFallback: Boolean, createdAt }
 model EnvVar      { id, projectId, key, valueCiphertext, target: PRODUCTION|PREVIEW|ALL }
-model Deployment  { id, projectId, commitSha, commitMessage, branch, trigger: MANUAL|PUSH,
+
+model Deployment  { id, projectId, commitSha, commitMessage, branch,
+                    trigger: MANUAL|PUSH,
                     status: QUEUED|BUILDING|UPLOADING|READY|FAILED|CANCELLED,
-                    detectedFramework?, resolvedOutputDir?, sizeBytes?,
+                    manifest: Json?,        // path -> { sha256, size, contentType }
+                    detectedFramework?, resolvedOutputDir?, totalBytes?, newBytes?,
                     errorMessage?, queuedAt, startedAt, finishedAt }
-model BuildLog    { id, deploymentId, seq, stream: STDOUT|STDERR|SYSTEM, text, at }
-model Alias       { id, hostname @unique, projectId, deploymentId, kind: PRODUCTION|BRANCH|PERMANENT|CUSTOM }
-model Domain      { id, projectId, hostname @unique, verified, verificationToken, createdAt }
+
+model Blob        { sha256 @id, size, contentType, refCount, createdAt }
+model Alias       { id, hostname @unique, projectId, deploymentId,
+                    kind: PRODUCTION|BRANCH|PERMANENT|CUSTOM }
+model Domain      { id, projectId, hostname @unique, verified, verificationToken }
+
+model BuildJob    { id, deploymentId, status, attempts, leasedUntil?, leasedBy?, createdAt }
 ```
 
-**Storage layout:**
+`Blob.refCount` is what makes garbage collection possible: deleting a deployment decrements
+its manifest's blobs, and a sweep removes those that reach zero. Without a refcount, a
+deduplicated store can never safely delete anything.
 
-```
-sources/<deploymentId>.tar.gz      # source snapshot, retained ~7 days
-sites/<deploymentId>/...           # built output, immutable
-```
-
-Upload the source as **one tarball**, not thousands of individual objects. The reference
-implementation does a per-file `PutObject` for every file in the repo and then a per-file
-`GetObject` in the worker; on a real project that's tens of thousands of round trips and
-dominates deploy time. One tarball up, one tarball down.
-
-Build output does need per-file objects (the edge serves them individually), so upload those
-with a bounded concurrency pool (~32) and correct `Content-Type` per extension.
+**Build logs are not rows.** Deploy_X keeps them in a Redis list; my first draft proposed a
+row per line in Postgres, which is millions of rows of write amplification for data read once
+or twice. Instead: live tail streams over `NOTIFY` while the build runs, and the complete log
+is flushed once to `logs/<deploymentId>.log` at completion. The SSE endpoint replays from
+that object if the build has finished, and subscribes if it hasn't.
 
 ---
 
-## 5. API surface
+## 8. API surface
 
 ```
-POST   /api/auth/github/callback     GitHub OAuth exchange
+POST   /api/auth/github/callback
 GET    /api/me
 
-POST   /api/projects                 { repoFullName, name, settings }
+POST   /api/projects                        { repoFullName, name, settings }
 GET    /api/projects
 GET    /api/projects/:id
-PATCH  /api/projects/:id             build settings
+PATCH  /api/projects/:id
 DELETE /api/projects/:id
 
 GET    /api/projects/:id/env
-PUT    /api/projects/:id/env         upsert (encrypted at rest, never returned in plaintext)
+PUT    /api/projects/:id/env                encrypted at rest, never returned in plaintext
 
-POST   /api/projects/:id/deployments        trigger a build { branch? }
+POST   /api/projects/:id/deployments        { branch? }
 GET    /api/projects/:id/deployments        paginated
 GET    /api/deployments/:id
 POST   /api/deployments/:id/cancel
-POST   /api/deployments/:id/promote         production alias -> this deployment
-GET    /api/deployments/:id/logs            replay persisted logs
+POST   /api/deployments/:id/promote
+GET    /api/deployments/:id/logs            completed log
 GET    /api/deployments/:id/logs/stream     SSE: replay + live tail
 
 POST   /api/projects/:id/domains
 POST   /api/domains/:id/verify
 DELETE /api/domains/:id
 
-POST   /api/webhooks/github          HMAC-verified push events
+POST   /api/webhooks/github                 HMAC-verified
 ```
 
-**Log streaming:** the worker publishes each line to a Redis channel *and* batch-inserts it
-into Postgres. The SSE endpoint replays persisted lines from Postgres, then subscribes to the
-channel for the live tail. This gives you both a live console and permanent build logs.
-(The reference polls `GET /logs` and returns the entire list every time — fine for a demo,
-but it re-sends the whole buffer on every poll.)
-
 ---
 
-## 6. Milestones
+## 9. Milestones
 
-Sized for one developer. Each milestone ends in something demonstrable.
+Sized for one developer. Each ends in something demonstrable.
 
 ### M0 — Foundations (2–3 days)
-pnpm + Turborepo monorepo (`apps/web`, `apps/api`, `apps/worker`, `apps/edge`,
-`packages/shared`, `packages/db`). `docker-compose.yml` with Postgres, Redis, MinIO. Prisma
-schema + first migration. Shared Zod types. ESLint/Prettier/tsconfig base. CI: typecheck,
-lint, test on every PR.
-**Done when:** `docker compose up && pnpm dev` brings up all four services and CI is green.
+pnpm + Turborepo monorepo (`apps/web`, `apps/api`, `apps/dispatcher`, `apps/edge`,
+`packages/shared`, `packages/db`). `docker-compose.yml`: Postgres + MinIO. Prisma schema and
+first migration. Shared Zod types. Lint/format/tsconfig base. CI: typecheck, lint, test.
+**Done when:** `docker compose up && pnpm dev` brings up all four services, CI green.
 
-### M1 — Walking skeleton (1 week)
-Paste a public repo URL → API clones (`--depth 1`) → tars → uploads to MinIO → enqueues →
-worker downloads, runs `npm ci && npm run build` **on the host** (temporarily), uploads
-`dist/` → edge serves it at `<id>.localhost:3001`. No auth, no containers, no detection.
-**Done when:** a Vite React app deploys end to end and loads in a browser.
-*This is the milestone that proves the wiring. Don't gold-plate it.*
+### M1 — Walking skeleton, right-shaped (1 week)
+Paste a public repo URL → job row → dispatcher claims it with `SKIP LOCKED` → `LocalDockerDriver`
+clones and builds in a container → output hashed into the blob store with a manifest → edge
+resolves `<id>.localhost` through manifest and blob cache and serves it.
 
-### M2 — Containerized builds + framework detection (1 week)
-Move builds into Docker with every limit from §3.2. Implement detection (§3.1) including
-the post-build heuristic, lockfile-based package manager selection, the Next.js/SvelteKit
-error messages, and the output size cap.
-**Done when:** a fixture repo per framework — React/Vite, Vue, Svelte, SvelteKit static,
-Next.js export, Astro, CRA, plain HTML — deploys correctly, **and** a fixture whose build
-script contains `rm -rf /` or a fork bomb fails safely without touching the host.
+No auth, no detection, no cache. But **content addressing and sandboxed builds are in from the
+first commit**, because those are the two things §2 says you cannot retrofit.
+**Done when:** a Vite React app deploys end to end, and a second deploy of the same commit
+uploads zero new blobs.
 
-### M3 — Real-time logs + lifecycle UI (1 week)
-BullMQ with retries and a dead-letter queue. SSE log streaming with persistence. Dashboard:
-deploy form, deployment list with status badges, terminal-style log console with autoscroll,
-deployment detail page, cancel button. Status transitions and timing captured in Postgres.
-**Done when:** you can watch a build stream live, cancel it mid-flight, and reload the page
-to see the complete logs of a finished build.
+### M2 — Output discovery + framework matrix (1 week)
+The observe-what-was-written mechanism from §5. Lockfile-based package manager selection.
+The four diagnostic error messages. Output size cap. Fixture repo per framework.
+**Done when:** React/Vite, Vue, Svelte, SvelteKit static, Next.js export, Astro, CRA, Angular
+and plain HTML fixtures all deploy correctly, and a Next.js repo *without* `output: 'export'`
+fails with the actionable message rather than a stack trace.
 
-### M4 — Auth, projects, auto-deploy (1 week)
-GitHub OAuth login. GitHub App install for repo listing and private-repo clone tokens.
-Project CRUD with build setting overrides. Encrypted env vars injected into the build
-container. Push webhook (HMAC-verified) → automatic build of the pushed branch.
-**Done when:** `git push` to a connected repo produces a deployment with no UI interaction.
+### M3 — Real sandbox + dependency cache (1 week)
+Implement `FlyMachineDriver` behind the §4.1 interface. Every limit from §4.2. Scoped
+per-deployment upload tokens. The §4.4 dependency cache. Cancellation. Lease expiry and
+automatic requeue.
+**Done when:** a fixture whose build script attempts `rm -rf /`, a fork bomb, and reading the
+dispatcher's environment fails safely with the host untouched — **and** the second build of a
+project is measurably faster than the first.
 
-### M5 — Aliases, previews, rollback, custom domains (1 week)
-Alias table + Redis hostname cache. Production / branch / permanent alias kinds. Promote and
-rollback buttons. PR preview URLs commented back onto the PR. Custom domains with CNAME
-verification and Caddy on-demand TLS.
-**Done when:** you can roll back production in one click and serve a real domain over HTTPS.
+### M4 — Logs + dashboard lifecycle (1 week)
+`NOTIFY`-backed SSE with replay from the flushed log object. Deploy form, deployment list with
+status badges, terminal-style console with autoscroll, detail page, cancel.
+**Done when:** you can watch a build stream live, cancel mid-flight, and reload a finished
+build to see its complete log.
 
-### M6 — Hardening and operations (1 week)
-Rate limits (deploys per user per hour, concurrent builds per user). Retention job: delete
-source tarballs after 7 days, prune non-aliased deployments after 30. Structured logging,
-Prometheus metrics (queue depth, build duration, success rate, p95 edge latency), Sentry.
-Graceful worker shutdown that requeues in-flight jobs. Orphaned-container reaper. Health and
-readiness endpoints.
-**Done when:** you can kill a worker mid-build and the job completes on another one.
+### M5 — Auth + GitHub App + auto-deploy (1 week)
+GitHub OAuth login. GitHub App install, repo listing, short-lived installation tokens for
+private clones. Project CRUD with setting overrides. Encrypted env vars. HMAC-verified push
+webhook → build.
+**Done when:** `git push` to a connected private repo produces a deployment with no UI
+interaction.
 
-### M7 — Production (3–4 days)
-Deploy `api`/`edge` on a small VM or Fly.io, workers on a dedicated isolated host, Postgres
-and Redis managed, storage on R2. Wildcard DNS `*.shipyard.app` + wildcard TLS. Runbook.
-Then **deploy the dashboard on Shipyard itself** — that's the real acceptance test.
+### M6 — Aliases, previews, rollback, domains (1 week)
+Alias kinds and the edge's hostname cache. Promote and rollback buttons. PR preview URLs
+commented back to the PR. Custom domains with CNAME verification and Caddy on-demand TLS.
+**Done when:** you roll production back one click and serve a real domain over HTTPS.
 
-**Total: roughly 6–7 weeks solo.** M1 and M2 carry the risk; the rest is mostly known work.
+### M7 — Operations (1 week)
+Rate limits (deploys/hour, concurrent builds/user). Blob GC via `refCount`. Retention for
+logs and unaliased deployments. Structured logging, metrics (queue depth, build duration,
+cache hit rate, blob dedup ratio, p95 edge latency), Sentry. Graceful shutdown returning
+leases. Orphaned-sandbox reaper. Health/readiness endpoints.
+**Done when:** you kill the dispatcher mid-build and the job completes after restart.
+
+### M8 — Production (3–4 days)
+`api` and `edge` on small VMs or Fly, Postgres managed, storage on R2, builds on Fly Machines.
+Wildcard DNS and TLS for `*.shipyard.app`. Runbook. Then **deploy the dashboard on Shipyard
+itself** — the real acceptance test.
+
+**Total: roughly 7–8 weeks solo.** M1 and M3 carry the risk.
 
 ---
 
-## 7. Risk register
+## 10. Risks
 
 | Risk | Mitigation |
 |---|---|
-| Build container escape | Non-root, cap-drop, read-only, no docker socket, isolated worker hosts; gVisor later |
-| Crypto-mining via free builds | Hard timeouts, CPU limits, per-user concurrency caps, deploys/hour rate limit |
-| Storage cost from abandoned deployments | Retention job from M6; count it in the size cap |
-| Framework detection misses a stack | Post-build heuristic + explicit override + a clear error, never a silent wrong deploy |
-| Redis loses queued jobs | BullMQ with persistence; job state also written to Postgres so it's recoverable |
-| A malicious repo serves phishing on your domain | Abuse reporting, takedown path, and keep user content on a domain separate from the dashboard's |
-| Huge repos / huge outputs | Shallow clone, source and output size caps, streaming uploads |
-| Cold edge latency on first request | Redis alias cache; optionally a CDN in front of `edge` |
+| Sandbox escape | microVM per build; non-root, cap-drop, read-only, no nested socket; scoped per-build credentials only |
+| Free builds used for crypto mining | Hard timeouts, CPU caps, per-user concurrency limit, deploys/hour rate limit |
+| Blob store grows forever | `refCount` + GC sweep (M7); dedup already cuts the growth rate hard |
+| Dependency cache poisoning | Key includes the lockfile hash; cache is per-project, never shared across projects |
+| Output discovery picks the wrong directory | Shallowest-`index.html`-written-during-build heuristic, plus explicit override, plus a clear failure — never a silent wrong deploy |
+| Job lost when dispatcher dies | Lease + visibility timeout; job state is a transactional Postgres row |
+| Edge cold-start latency | Local blob LRU warms fast; optional CDN in front |
+| Malicious site on your domain | Abuse reporting and takedown path; keep user content on a domain separate from the dashboard's |
 
 ---
 
-## 8. Testing
+## 11. Testing
 
-- **Unit:** framework detection against a table of fixture `package.json` files (cheap, high
-  value, catches most regressions); path normalization in the edge router with an explicit
-  traversal-attack suite.
-- **Integration:** API + Postgres + Redis + MinIO via Testcontainers; full deploy lifecycle.
-- **E2E fixture repos:** one minimal repo per supported framework, committed under
-  `fixtures/`, deployed in CI nightly. This is the regression net for the whole product.
-- **Security:** a `fixtures/malicious/` repo whose build script attempts host writes, socket
-  access, and a fork bomb. It must fail cleanly. Run it in CI.
-- **Load:** k6 against the edge to size the object-storage read path.
-
----
-
-## 9. Stretch goals
-
-Build-cache restore across deploys (keyed on lockfile hash — the single biggest win on
-build time), `_headers`/`_redirects` support, deploy-time password protection, Slack/Discord
-notifications, monorepo workspace detection, GitLab/Bitbucket sources, other runtimes
-(Python/Go/Hugo) via alternative build images, and — if you ever relax the static-only
-constraint — SSR on a container runtime, which is a whole second platform.
+- **Unit:** output-discovery against recorded before/after filesystem trees (cheap, catches
+  most regressions); manifest resolution including paths that aren't in the manifest.
+- **Integration:** API + Postgres + MinIO via Testcontainers; full deploy lifecycle; verify
+  the second identical deploy uploads zero blobs.
+- **E2E fixtures:** one minimal repo per supported framework under `fixtures/`, deployed
+  nightly in CI. This is the regression net for the product.
+- **Security:** `fixtures/malicious/` attempting host writes, credential exfiltration, and a
+  fork bomb. Must fail cleanly. Runs in CI.
+- **Load:** k6 against the edge, measuring blob cache hit rate under realistic asset mixes.
 
 ---
 
-## 10. Credits
+## 12. Later
 
-Architecture informed by [Deploy_X](https://github.com/bharath200415/Deploy_X) by
-[@bharath200415](https://github.com/bharath200415), which demonstrates the core
-upload → queue → build → serve pipeline. Shipyard's departures from it — containerized
-builds, framework detection, tarball source transfer, immutable deployments with aliases,
-path-traversal-safe routing, and Postgres-backed state — are noted inline above.
+Build-cache beyond dependencies (framework build caches keyed on source hash), `_headers` and
+`_redirects` support, password-protected deployments, Slack/Discord notifications, monorepo
+workspace detection, GitLab/Bitbucket sources, other runtimes via alternative sandbox images,
+and — only if the static-only constraint is ever relaxed — SSR, which is a second platform.
+
+---
+
+## 13. Credits
+
+[Deploy_X](https://github.com/bharath200415/Deploy_X) by
+[@bharath200415](https://github.com/bharath200415) is a clear working demonstration of the
+build-and-serve pipeline and the fastest way to understand the problem. §2 explains where
+Shipyard takes a different path and why.
