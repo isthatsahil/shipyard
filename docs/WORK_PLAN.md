@@ -166,7 +166,7 @@ process that holds credentials are different processes on different machines.
 - **Storage:** S3-compatible — MinIO locally, Cloudflare R2 in production (zero egress fees,
   which matters when the workload is serving static assets)
 - **Edge TLS:** Caddy with on-demand TLS for custom domains
-- **Repo:** pnpm workspaces + Turborepo
+- **Repo:** npm workspaces (§3.3) — no pnpm, no Turborepo
 
 ### 3.1 Postgres only — skip Redis until it's earned
 
@@ -199,6 +199,68 @@ small, the edge queries them constantly, and having them transactional with the 
 is what makes promotion atomic.
 
 No source is stored at all. The commit SHA is the source of truth; a rebuild re-clones.
+
+### 3.3 npm workspaces — not pnpm, not Turborepo
+
+npm 10 ships with Node 22 and its workspaces are sufficient here. The reasons to reach for
+pnpm and Turborepo are real, but they're scale reasons, and this repo is six packages built
+by one person.
+
+What you'd actually be buying:
+
+| Tool | Buys you | Worth it at six packages? |
+|---|---|---|
+| pnpm | Faster installs, hardlinked store, strict `node_modules` that catches undeclared imports | No. The strictness is nice; it isn't worth a second toolchain and a corepack step in every Dockerfile |
+| Turborepo | Task graph ordering, local + remote task caching, parallelism | No. The cache win is seconds on a repo this size |
+
+**The one thing npm genuinely lacks is topological script ordering.** Verified on npm 10.9.7:
+given `apps/api` depending on `packages/shared`, `npm run build --workspaces` runs *api
+first* — it uses workspace declaration order, not the dependency graph. Turborepo's main
+selling point is fixing exactly this.
+
+**So don't create the problem.** Shared packages are consumed as TypeScript source, not as
+build artifacts:
+
+```jsonc
+// packages/shared/package.json
+{ "name": "@shipyard/shared", "main": "./src/index.ts", "types": "./src/index.ts" }
+```
+
+`tsx` in dev, `tsc`/esbuild at build time, and Vite for the frontend all resolve that through
+the workspace symlink directly. With nothing to pre-build, there is no build order to get
+wrong, and the root scripts stay honest:
+
+```jsonc
+"scripts": {
+  "dev":       "concurrently -n api,edge,disp,web \"npm:dev:*\"",
+  "dev:api":   "npm run dev -w apps/api",
+  "dev:edge":  "npm run dev -w apps/edge",
+  "dev:disp":  "npm run dev -w apps/dispatcher",
+  "dev:web":   "npm run dev -w apps/web",
+  "typecheck": "tsc -b",                      // project references handle ordering
+  "test":      "npm run test --workspaces --if-present"
+}
+```
+
+Two measured caveats behind that block, both verified on npm 10.9.7 rather than assumed:
+
+- **`npm run <script> --workspaces` runs serially.** A 1500ms script followed by an instant
+  one took 1862ms. Fine for `test` and `build`; useless for `dev`, where four servers must
+  run at once — hence `concurrently`, one small dev dependency. That is the honest cost of
+  not using Turborepo, and it is the whole cost.
+- **`node --run` does not accept `--workspaces`** (`node: bad option`). It runs a script from
+  the local `package.json` only, so it is not a workspace-aware substitute for `npm run`.
+
+`tsc -b` with TypeScript project references *does* order correctly, so typechecking — the one
+step that genuinely has a dependency graph — is handled by the compiler rather than a task
+runner.
+
+Revisit this when a real trigger appears: a package that must be compiled before others can
+use it, CI install times that hurt, or a phantom-dependency bug that strict linking would
+have caught. Migrating npm workspaces → pnpm later is a lockfile regeneration and a CI line;
+it is not a decision worth pre-paying for.
+
+---
 
 ---
 
@@ -419,10 +481,11 @@ POST   /api/webhooks/github                 HMAC-verified
 Sized for one developer. Each ends in something demonstrable.
 
 ### M0 — Foundations (2–3 days)
-pnpm + Turborepo monorepo (`apps/web`, `apps/api`, `apps/dispatcher`, `apps/edge`,
+npm workspaces monorepo (`apps/web`, `apps/api`, `apps/dispatcher`, `apps/edge`,
 `packages/shared`, `packages/db`). `docker-compose.yml`: Postgres + MinIO. Prisma schema and
-first migration. Shared Zod types. Lint/format/tsconfig base. CI: typecheck, lint, test.
-**Done when:** `docker compose up && pnpm dev` brings up all four services, CI green.
+first migration. Shared Zod types published as source (§3.3). Lint/format/tsconfig base.
+CI: typecheck, lint, test.
+**Done when:** `docker compose up && npm run dev` brings up all four services, CI green.
 
 ### M1 — Walking skeleton, right-shaped (1 week)
 Paste a public repo URL → job row → dispatcher claims it with `SKIP LOCKED` → `LocalDockerDriver`
