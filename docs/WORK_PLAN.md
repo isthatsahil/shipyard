@@ -255,10 +255,61 @@ Two measured caveats behind that block, both verified on npm 10.9.7 rather than 
 step that genuinely has a dependency graph — is handled by the compiler rather than a task
 runner.
 
-Revisit this when a real trigger appears: a package that must be compiled before others can
-use it, CI install times that hurt, or a phantom-dependency bug that strict linking would
-have caught. Migrating npm workspaces → pnpm later is a lockfile regeneration and a CI line;
-it is not a decision worth pre-paying for.
+#### Docker: npm prunes per service, natively
+
+The strongest argument for adopting pnpm early is usually Docker. Building four service
+images from one monorepo, you don't want `apps/api`'s image carrying Vite, React and Tailwind
+because `apps/web` declared them. pnpm's answer is `pnpm deploy --filter`; Turborepo's is
+`turbo prune --docker`. Both exist because people assume npm can't do it.
+
+It can. Verified on npm 10.9.7 with a root workspace containing `apps/api` (express) and
+`apps/web` (react, react-dom):
+
+- `npm ci -w apps/api` installed **70 packages, 4.4 MB** — express's tree only. `react` and
+  `react-dom` were absent.
+- Only `node_modules/@sy/api` was symlinked; `web` was not linked in.
+- It succeeded with `apps/web/package.json` **deleted entirely**, so a service Dockerfile
+  needs only the root `package.json`, the root `package-lock.json`, and its own workspace
+  manifests — a small, cache-friendly layer that doesn't invalidate when an unrelated
+  service's dependencies change.
+
+So the per-service image story needs no extra tooling.
+
+#### What you are actually giving up
+
+One thing, and it's real: **npm hoists, so phantom dependencies compile locally and fail in
+the pruned image.** With the layout above, `apps/api` can `import "react"` — it's hoisted to
+the root `node_modules` by `apps/web` — and that works in dev and dies in the `npm ci -w`
+Docker build. pnpm's strict symlinked layout makes that unrepresentable.
+
+Two cheap mitigations, both worth having anyway:
+
+- CI builds every service image on every PR, which turns a phantom dependency into a red
+  build rather than a production surprise.
+- `eslint-plugin-import`'s `no-extraneous-dependencies` rule catches most of them at lint time.
+
+#### When to revisit — and note the two tools have opposite retrofit costs
+
+They get named together, but they are not one decision:
+
+- **Turborepo is a bolt-on.** It wraps the existing npm scripts. Adopting it later is one
+  config file and touches no Dockerfile, no lockfile, no contributor setup. There is
+  therefore no reason at all to pre-pay for it.
+- **pnpm is a foundation choice.** It changes the lockfile, every Dockerfile, the CI install
+  step, and everyone's local setup. Still not expensive — roughly a day — but it is the one
+  of the two worth deciding deliberately.
+
+Concrete triggers:
+
+| Signal | Action |
+|---|---|
+| CI wall time past ~5 min, or repeated rebuilds of unchanged packages | Add Turborepo. This is the first thing to reach for |
+| More than ~2 regular contributors | Turborepo remote caching starts paying |
+| Past ~15 packages, or CI install past ~60s | Move to pnpm |
+| A phantom-dependency bug reaches production despite the mitigations above | Move to pnpm |
+
+Until one of those fires, npm workspaces is not a compromise for this repo — it is the
+correct size of tool.
 
 ---
 
