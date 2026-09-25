@@ -1,0 +1,33 @@
+# Tooling / agent directories
+.agents
+skills-lock.json
+.claude
+.impeccable
+PRODUCT.md
+
+docs
+# Dependencies
+node_modules
+
+# Build output
+dist
+*.tsbuildinfo
+
+# Secrets — .env.example is committed, .env is not
+.env
+.env.*
+!.env.example
+
+# Caddy's local root CA, copied out to trust it on the host (see phase-0 docs)
+caddy-root.crt
+
+# Local infrastructure state (Postgres, Redis, MinIO volumes and build workdirs)
+docker/data
+/builds
+
+# Prisma generated client, if the output is ever redirected into the repo
+packages/db/generated
+
+# OS / editor
+.DS_Store
+*.swp

@@ -1,0 +1,30 @@
+{
+  "name": "@shipyard/api",
+  "version": "0.0.0",
+  "description": "Control plane: auth, projects, deployments, log streaming, webhooks",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsdown",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "pino": "^10.3.1",
+    "pino-http": "^11.0.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@shipyard/db": "workspace:*",
+    "@shipyard/shared": "workspace:*",
+    "@types/express": "^5.0.6",
+    "pino-pretty": "^13.1.3"
+  }
+}

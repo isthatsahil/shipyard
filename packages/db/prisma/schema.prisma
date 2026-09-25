@@ -1,0 +1,271 @@
+// Shipyard data model.
+//
+// Design notes and rationale live in docs/phases/phase-0-setup.md (Step 3).
+// Postgres is the durable ledger; Redis holds only ephemeral state (BullMQ
+// queue, log streams, the route cache) and is never the source of truth.
+//
+// `///` comments are documentation comments: Prisma carries them into the
+// generated client as JSDoc, so they show up on hover in the API, worker and
+// router. `//` comments (like this one) stay in this file only.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  // No `url` here — Prisma 7 reads it from prisma7.config.ts.
+}
+
+/// Lifecycle of a single build. The happy path runs top to bottom:
+/// queued → cloning → detecting → building → uploading → ready.
+/// `failed`, `cancelled` and `archived` are terminal.
+enum DeploymentStatus {
+  /// Row created, job enqueued, no worker has picked it up yet.
+  queued
+
+  /// Worker is running `git clone --depth 1` into its build directory.
+  cloning
+
+  /// detectFramework() is inspecting the repo for framework, commands and output dir.
+  detecting
+
+  /// `npm install && npm run build` is running inside the sandboxed Docker container.
+  building
+
+  /// Build output is being walked and uploaded to object storage.
+  uploading
+
+  /// Files are live and servable. Only a `ready` deployment may be promoted.
+  ready
+
+  /// Build failed; see `error` and the archived log. Files may be absent or partial.
+  failed
+
+  /// Killed deliberately — user cancelled, or a newer commit superseded this build.
+  cancelled
+
+  /// Retention GC deleted the stored files; the row is kept for history.
+  archived
+}
+
+/// Whether a deployment is a candidate for the project's live URL, or a
+/// throwaway build for a pull request.
+enum DeploymentKind {
+  /// Built from the project's configured branch; eligible for promotion.
+  production
+
+  /// Built from a pull request. Never auto-promoted; reachable only at its preview URL.
+  preview
+}
+
+/// A platform account, backed by a GitHub identity.
+///
+/// Populated by GitHub OAuth in Phase 3. Until then the seed script inserts a
+/// single dev user with `githubId = 0` so that projects — which require an
+/// owner — can be created at all.
+model User {
+  id String @id @default(cuid())
+
+  /// GitHub's numeric account id: the stable identity anchor (logins can be renamed).
+  /// `0` is the reserved sentinel for the seeded local dev user; real ids are positive.
+  githubId Int @unique
+
+  /// GitHub handle, for display. Mutable on GitHub's side, so never used as a key.
+  login String
+
+  /// GitHub avatar image URL. Null until OAuth fills it in.
+  avatarUrl String?
+
+  /// GitHub OAuth token, AES-256-GCM encrypted and base64-encoded.
+  /// Decrypted only at the moment of use — never logged, never put in a queue payload.
+  accessToken String?
+
+  createdAt DateTime @default(now())
+
+  /// Every project this user owns. Deleting the user cascades to all of them.
+  projects Project[]
+}
+
+/// One deployable site: a repository plus its build settings and its current
+/// live deployment. The unit a user creates in the dashboard.
+model Project {
+  id String @id @default(cuid())
+
+  /// Owner. Cascades: deleting a user deletes their projects, and in turn
+  /// those projects' deployments.
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Human-readable name shown in the dashboard. Free-form; not a key.
+  name String
+
+  /// The subdomain this project is served on: `<slug>.<BASE_DOMAIN>`.
+  /// Validated as `[a-z0-9-]{3,40}` with a reserved list (api, www, admin, …).
+  /// Unique because two projects resolving to one hostname would be a hijack.
+  slug String @unique
+
+  /// Git remote to clone. HTTPS; private repos use the owner's token at clone time.
+  repoUrl String
+
+  /// Branch to build for production deployments, and the branch push webhooks watch.
+  branch String @default("main")
+
+  /// Subdirectory to treat as the project root, for monorepos. "." means the repo root.
+  rootDir String @default(".")
+
+  /// User overrides for framework detection. Null means "trust detectFramework()";
+  /// a value here wins over anything detected, which is what makes a misdetection
+  /// correctable in the UI instead of a dead end.
+  installCmd String?
+  buildCmd   String?
+  outputDir  String?
+
+  /// Node major version, selecting the prebuilt `shipyard/builder:node<major>` image.
+  nodeVersion String @default("22")
+
+  /// When true the router serves `/index.html` for paths that match no file,
+  /// so client-side routes like /settings/profile work on reload.
+  spaFallback Boolean @default(true)
+
+  /// Build-time environment variables: an encrypted JSON array of {key,value}.
+  /// Deliberately `String` and not `Json` — ciphertext is an opaque blob that
+  /// cannot be queried or indexed, and typing it as Json would imply otherwise.
+  envVars String?
+
+  /// GitHub webhook registered for this repo, so pushes trigger deployments (Phase 3).
+  webhookId     Int?
+  /// HMAC secret for verifying `X-Hub-Signature-256` on incoming webhooks. Encrypted.
+  webhookSecret String?
+
+  /// The deployment currently served at this project's URL.
+  ///
+  /// Promotion and rollback are both a single write to this one pointer, which
+  /// is why rollback is instant. `SetNull` rather than `Cascade` on purpose: if
+  /// the active deployment is ever deleted the project survives with no live
+  /// site, instead of the project being destroyed along with it. `@unique` is
+  /// required for the one-to-one and also stops one deployment being active for
+  /// two projects.
+  activeDeploymentId String?     @unique
+  activeDeployment   Deployment? @relation("ActiveDeployment", fields: [activeDeploymentId], references: [id], onDelete: SetNull)
+
+  /// Full build history, newest first in the UI. Named relation because this
+  /// model has two distinct relations to Deployment.
+  deployments Deployment[] @relation("ProjectDeployments")
+
+  /// Custom domains pointed at this project, beyond the default slug subdomain.
+  domains Domain[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// One build attempt, and the immutable set of files it produced.
+///
+/// Deployments are never mutated after they go `ready`: each writes to its own
+/// `deployments/<id>/` storage prefix. That is what makes rollback a pointer
+/// flip, gives every build its own preview URL, and reduces retention GC to
+/// "delete prefixes that are not active and are older than N days".
+model Deployment {
+  /// Also used as the preview subdomain (`<id>.<BASE_DOMAIN>`) and as the
+  /// storage prefix segment. cuid rather than an auto-increment integer so
+  /// these public URLs cannot be enumerated and leak total platform volume.
+  id String @id @default(cuid())
+
+  /// Owning project. Cascades: deleting a project deletes its whole history.
+  projectId String
+  project   Project @relation("ProjectDeployments", fields: [projectId], references: [id], onDelete: Cascade)
+
+  /// Back-reference for the `ActiveDeployment` relation — set when this exact
+  /// deployment is the one the project currently serves. Do not write directly;
+  /// promote by setting `Project.activeDeploymentId`.
+  activeFor Project? @relation("ActiveDeployment")
+
+  /// Production build or a pull-request preview.
+  kind DeploymentKind @default(production)
+
+  /// Source PR number when `kind = preview`; null otherwise.
+  prNumber Int?
+
+  status DeploymentStatus @default(queued)
+
+  /// Commit this build came from. Null for the very first manual deployment,
+  /// before a clone has resolved HEAD.
+  commitSha String?
+  /// First line of the commit message, for the history list.
+  commitMsg String?
+
+  /// Framework name reported by detectFramework() — "vite", "next", "cra",
+  /// "static", … Informational; the resolved commands below are what ran.
+  framework String?
+
+  /// What the build actually used, after overrides, detection and the
+  /// post-build output scan were resolved. Recorded per deployment so a build
+  /// stays explainable even after the project's settings are edited.
+  resolvedBuildCmd  String?
+  resolvedOutputDir String?
+
+  /// Object-storage prefix holding this deployment's files (`deployments/<id>/`).
+  /// Stored rather than derived so the storage layout can change without
+  /// breaking every historical row.
+  storagePrefix String
+
+  /// Upload statistics, shown in the UI and used for retention accounting.
+  /// `sizeBytes` is BigInt because Int tops out at ~2 GB. Note it does not
+  /// survive JSON.stringify — call .toString() before returning it from the API.
+  fileCount Int?
+  sizeBytes BigInt?
+
+  /// Failure reason, safe to show in the dashboard. Set from the typed errors
+  /// in packages/shared; full output stays in the archived log.
+  error String?
+
+  /// When the worker picked the job up, and when it reached a terminal status.
+  /// Both null while queued; `finishedAt` stays null for a wedged build.
+  startedAt  DateTime?
+  finishedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  /// Last write to this row. The debugging field: when a build is stuck in
+  /// `building`, this answers "is it still making progress?" — which the
+  /// timestamps above cannot. Maintained by Prisma Client, so raw SQL and
+  /// manual psql edits will not bump it.
+  updatedAt DateTime @updatedAt
+
+  /// Backs the per-project history list and, more importantly, the
+  /// "is there a newer ready deployment?" guard that stops a slow older build
+  /// from overwriting a newer one during promotion.
+  @@index([projectId, createdAt(sort: Desc)])
+  /// Backs "what is building right now?" and the orphan-cleanup sweep that
+  /// finds deployments stuck in a running status with no live container.
+  @@index([status])
+}
+
+/// A custom hostname pointed at a project, in addition to its slug subdomain
+/// (Phase 5). TLS is issued on demand by Caddy once `verified` is true.
+model Domain {
+  id String @id @default(cuid())
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  /// Fully-qualified hostname, e.g. "www.example.com". Globally unique: two
+  /// projects claiming one hostname is unresolvable at request time.
+  hostname String @unique
+
+  /// Random token the user publishes in DNS to prove they control the domain.
+  verificationToken String
+
+  /// Set once the DNS record has been observed. The router refuses to serve,
+  /// and Caddy refuses to request a certificate for, an unverified hostname.
+  verified Boolean @default(false)
+
+  /// Consecutive failed verification checks, for backoff and eventual give-up.
+  /// Certificate state itself is deliberately not mirrored here — Caddy owns it,
+  /// and a second copy would go stale.
+  failedChecks Int @default(0)
+
+  createdAt DateTime @default(now())
+}

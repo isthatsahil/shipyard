@@ -1,0 +1,32 @@
+{
+  "name": "@shipyard/worker",
+  "version": "0.0.0",
+  "description": "Build worker: clone, detect framework, build in Docker, upload, promote",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsdown",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "bullmq": "^6.3.8",
+    "dockerode": "^5.0.1",
+    "fast-glob": "^3.3.3",
+    "ioredis": "^6.0.0",
+    "p-limit": "^7.3.3",
+    "pino": "^10.3.1",
+    "simple-git": "^3.36.0"
+  },
+  "devDependencies": {
+    "@shipyard/db": "workspace:*",
+    "@shipyard/shared": "workspace:*",
+    "@types/dockerode": "^4.0.1"
+  }
+}

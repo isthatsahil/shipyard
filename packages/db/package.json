@@ -1,0 +1,27 @@
+{
+  "name": "@shipyard/db",
+  "version": "0.0.0",
+  "description": "Prisma schema, migrations and typed client",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "license": "MIT",
+  "scripts": {
+    "generate": "prisma generate",
+    "migrate": "prisma migrate dev",
+    "migrate:deploy": "prisma migrate deploy",
+    "seed": "tsx --env-file=../../.env prisma/seed.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@prisma/adapter-pg": "^7.10.0",
+    "@prisma/client": "^7.10.0"
+  },
+  "devDependencies": {
+    "dotenv": "^18.0.3",
+    "prisma": "^7.10.0"
+  }
+}

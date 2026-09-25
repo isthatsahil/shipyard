@@ -1,0 +1,29 @@
+{
+	local_certs
+}
+
+# One certificate per hostname, issued on first request. A `*.localhost`
+# wildcard is what plain `tls internal` would produce here, and clients reject
+# wildcards directly under a top-level name, even with Caddy's CA trusted.
+# No `ask` guard: only this machine can reach it, and every certificate is
+# signed by the local CA. Production (Caddyfile.prod) guards on_demand with `ask`.
+(dev_tls) {
+	tls internal {
+		on_demand
+	}
+}
+
+api.localhost {
+	import dev_tls
+	reverse_proxy api:4000
+}
+
+app.localhost {
+	import dev_tls
+	reverse_proxy web:5173
+}
+
+*.localhost, localhost {
+	import dev_tls
+	reverse_proxy router:4001
+}
