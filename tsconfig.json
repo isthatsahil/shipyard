@@ -1,0 +1,15 @@
+{
+  // Root-level tooling config files (eslint.config.ts and any future ad-hoc
+  // scripts) belong to no app or package, so without this they fall back to
+  // the editor's inferred config — one with no `types: ["node"]`, which is why
+  // `import.meta.dirname` reported "Property 'dirname' does not exist on type
+  // 'ImportMeta'". The same reasoning puts prisma7.config.ts in
+  // packages/db/tsconfig.json's include.
+  //
+  // This file deliberately does NOT reference the workspace packages: each one
+  // is type-checked by its own `pnpm typecheck`, and listing them here would
+  // create a second, competing project definition for the same sources.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": { "types": ["node"] },
+  "include": ["eslint.config.ts", "*.ts"]
+}

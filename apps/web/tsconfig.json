@@ -1,0 +1,13 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ],
+  // Not used for type checking (that is tsconfig.app.json). The shadcn CLI
+  // reads this root file to resolve the `@/…` aliases in components.json;
+  // without it, it writes into a literal `@/` folder instead of `src/`.
+  "compilerOptions": {
+    "paths": { "@/*": ["./src/*"] }
+  }
+}

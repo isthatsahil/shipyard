@@ -1,0 +1,18 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+# Packages allowed to run install scripts (pnpm blocks them by default).
+# `false` is an explicit refusal and stops pnpm re-prompting.
+allowBuilds:
+  # Required.
+  esbuild: true # places its native binary; vitest needs it (tsdown uses rolldown)
+  prisma: true # CLI
+  "@prisma/client": true # generates the typed client
+  "@prisma/engines": true # downloads the schema engine used by migrations (the query path is WASM inside @prisma/client)
+
+  # Declined: transitive native builds we do not exercise.
+  ssh2: false # dockerode's SSH transport; we use /var/run/docker.sock
+  cpu-features: false # optional crypto acceleration for ssh2
+  protobufjs: false # gRPC path in dockerode; we use the REST API
+  msgpackr-extract: false # native msgpack accelerator for bullmq; pure-JS fallback is fine here

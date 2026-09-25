@@ -1,0 +1,19 @@
+# Host installs are macOS/arm-native and would overwrite the ones `deps` installed.
+node_modules
+**/node_modules
+
+# Build output is produced inside the image.
+dist
+**/dist
+packages/db/generated
+
+.git
+.env
+.env.*
+!.env.example
+docker/data
+/builds
+**/*.log
+.DS_Store
+.vscode
+.idea
