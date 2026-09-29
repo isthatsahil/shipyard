@@ -19,13 +19,15 @@ const base = z.object({
   S3_FORCE_PATH_STYLE: z
     .enum(["true", "false"])
     .default("true")
-    .transform((v) => v === "true"),
+    .transform((value) => value === "true"),
 });
 
 export type BaseEnv = z.infer<typeof base>;
 
 /** Parse process.env against the base schema plus any service-specific extension. */
-export function loadEnv<T extends z.ZodRawShape = Record<string, never>>(
+// Default to an empty shape, not Record<string, never>: that has an index
+// signature, so extending with it types every base key as never/undefined.
+export function loadEnv<T extends z.ZodRawShape = Record<never, never>>(
   extra?: T,
 ) {
   // Always extend, even with an empty shape: a ternary here would make `schema`
@@ -37,7 +39,7 @@ export function loadEnv<T extends z.ZodRawShape = Record<string, never>>(
     console.error(
       "Invalid environment:\n" +
         result.error.issues
-          .map((i) => `  ${i.path.join(".")}: ${i.message}`)
+          .map((issue) => `  ${issue.path.join(".")}: ${issue.message}`)
           .join("\n"),
     );
     process.exit(1);

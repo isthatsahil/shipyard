@@ -1,7 +1,10 @@
+import { useTranslation } from "react-i18next";
+
 import "@/App.css";
 
 function App() {
-  return <>Shipyard</>;
+  const { t } = useTranslation();
+  return <>{t("appName")}</>;
 }
 
 export default App;

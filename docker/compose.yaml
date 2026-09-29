@@ -11,6 +11,12 @@ x-app-env: &app-env
   S3_SECRET_KEY: minio12345
   S3_FORCE_PATH_STYLE: "true"
 
+# Docker keeps each container's stdout in a JSON file (`docker compose logs`).
+# Without these limits the file grows until the container is removed.
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
 services:
   postgres:
     image: postgres:16
@@ -55,6 +61,7 @@ services:
 
   api:
     build: { context: .., dockerfile: apps/api/Dockerfile }
+    logging: *logging
     environment: { <<: *app-env, PORT: 4000 }
     depends_on:
       postgres: { condition: service_healthy }
@@ -63,14 +70,21 @@ services:
 
   worker:
     build: { context: .., dockerfile: apps/worker/Dockerfile }
+    logging: *logging
     environment:
       <<: *app-env
       BUILD_CONCURRENCY: 2
-      BUILD_TIMEOUT_MS: 900000
-      BUILDS_HOST_PATH: ${PWD}/data/builds # host path of the shared volume (see Phase 1)
+      # Overridable so the e2e run can shorten it: BUILD_TIMEOUT_MS=60000 pnpm infra:up
+      BUILD_TIMEOUT_MS: ${BUILD_TIMEOUT_MS:-900000}
+      # Must name the same host directory as the /builds mount below: the worker
+      # clones into /builds, then asks the host's Docker daemon to bind-mount it
+      # into build containers by its host path. Both use ${PWD} (not ./, which
+      # compose resolves relative to this file) so they can't drift apart.
+      # ${PWD} is the repo root under `pnpm infra:up`.
+      BUILDS_HOST_PATH: ${PWD}/data/builds
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ./data/builds:/builds
+      - ${PWD}/data/builds:/builds
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
@@ -79,6 +93,7 @@ services:
 
   router:
     build: { context: .., dockerfile: apps/router/Dockerfile }
+    logging: *logging
     environment: { <<: *app-env, PORT: 4001 }
     depends_on:
       postgres: { condition: service_healthy }

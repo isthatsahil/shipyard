@@ -217,9 +217,17 @@ model Deployment {
   fileCount Int?
   sizeBytes BigInt?
 
-  /// Failure reason, safe to show in the dashboard. Set from the typed errors
-  /// in packages/shared; full output stays in the archived log.
+  /// Failure reason in English, safe to show in the dashboard. Set from the
+  /// typed errors in packages/shared; full output stays in the archived log.
+  /// The dashboard prefers `errorCode` and uses this only as a fallback.
   error String?
+
+  /// Translatable failure reason: a message code from
+  /// `@shipyard/shared/messages` (e.g. "pipeline.build_failed") and the
+  /// values interpolated into it (e.g. `{ "exitCode": 1 }`). The dashboard
+  /// translates these into the viewer's locale.
+  errorCode   String?
+  errorParams Json?
 
   /// When the worker picked the job up, and when it reached a terminal status.
   /// Both null while queued; `finishedAt` stays null for a wedged build.
