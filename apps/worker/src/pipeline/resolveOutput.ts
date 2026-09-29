@@ -3,7 +3,7 @@ import path from "node:path";
 import { OutputNotFoundError } from "@shipyard/shared/errors";
 import { prisma } from "@shipyard/db";
 import { postBuildScan } from "../detect/index.js";
-import { isInside } from "../lib/paths.js";
+import { isInside, resolvesInside } from "../lib/paths.js";
 import type { BuildContext } from "./context.js";
 
 /**
@@ -15,7 +15,8 @@ import type { BuildContext } from "./context.js";
  * folder used on the deployment.
  *
  * @throws {OutputNotFoundError} If no folder with an `index.html` is found,
- *   or the configured folder is outside the repo (e.g. `../../etc`).
+ *   or the folder is outside the repo, by path (`../../etc`) or through a
+ *   symlink.
  */
 export async function resolveOutput(ctx: BuildContext) {
   const detected = ctx.detect!;
@@ -39,6 +40,10 @@ export async function resolveOutput(ctx: BuildContext) {
     throw new OutputNotFoundError([...tried, "dist", "build", "out", "public"]);
 
   const abs = path.resolve(ctx.repoRoot, out);
+  // The build may have made the folder a symlink (`dist -> /`), which the text
+  // check above can't see. Uploading through it would publish the worker's files.
+  if (!(await resolvesInside(ctx.repoRoot, abs)))
+    throw new OutputNotFoundError([out]);
   ctx.outputPath = abs;
   ctx.logger.line("output", `Using ${out}/`);
   await prisma.deployment.update({

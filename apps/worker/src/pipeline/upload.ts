@@ -20,7 +20,8 @@ const EXCLUDE = [
 ];
 
 /**
- * Pipeline step: uploads every file in the output folder to the deployment's
+ * Pipeline step: uploads every regular file in the output folder (symlinks are
+ * skipped and logged) to the deployment's
  * storage prefix, 16 at a time, with its content type and cache headers.
  * Then writes `_meta.json` and saves the file count and total size on the
  * deployment.
@@ -29,12 +30,28 @@ const EXCLUDE = [
  */
 export async function upload(ctx: BuildContext) {
   const root = ctx.outputPath!;
-  const files = await fg("**/*", {
+  // Every entry, not just files, so symlinks show up and can be reported:
+  // with `onlyFiles` fast-glob would drop them silently.
+  const listed = await fg("**/*", {
     cwd: root,
-    onlyFiles: true,
+    onlyFiles: false,
     dot: true,
     ignore: EXCLUDE,
+    followSymbolicLinks: false,
   });
+  // Regular files only. The worker reads as root, so a symlink in the output
+  // (committed, or made by the build) such as `env.txt -> /proc/self/environ`
+  // would publish whatever it points at, including the worker's own secrets.
+  const files: string[] = [];
+  for (const rel of listed) {
+    const entry = await fs.promises.lstat(path.join(root, rel));
+    if (entry.isFile()) files.push(rel);
+    else if (entry.isSymbolicLink())
+      ctx.logger.line(
+        "warn",
+        `Skipped ${rel}: symbolic links are not uploaded.`,
+      );
+  }
   if (!files.length) throw new Error("output directory is empty");
 
   const limit = pLimit(16);
@@ -45,7 +62,7 @@ export async function upload(ctx: BuildContext) {
     files.map((rel) =>
       limit(async () => {
         const abs = path.join(root, rel);
-        const size = (await fs.promises.stat(abs)).size;
+        const size = (await fs.promises.lstat(abs)).size;
         bytes += size;
         await ctx.store.put(
           ctx.deployment.storagePrefix + rel,

@@ -822,6 +822,7 @@ Everything that can be learned from `package.json` and the lockfiles next to it.
 import fs from "node:fs";
 import path from "node:path";
 import type { Framework, PackageManager } from "./types.js";
+import { readRepoFile } from "./readRepoFile.js";
 
 export interface PkgInfo {
   exists: boolean;
@@ -831,9 +832,9 @@ export interface PkgInfo {
 }
 
 export function readPackageJson(root: string): PkgInfo {
-  const pkgPath = path.join(root, "package.json");
-  if (!fs.existsSync(pkgPath)) return { exists: false, deps: {}, scripts: {} };
-  const json = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+  const src = readRepoFile(root, "package.json");
+  if (src === null) return { exists: false, deps: {}, scripts: {} };
+  const json = JSON.parse(src);
   return {
     exists: true,
     deps: { ...(json.dependencies ?? {}), ...(json.devDependencies ?? {}) },
@@ -887,6 +888,33 @@ export function nodeVersionFromEngines(engines?: { node?: string }): "20" | "22"
 - **Install commands use the lockfile strictly** (`--frozen-lockfile`, `--immutable`, `npm ci`). The build installs exactly what the repo commits, and fails if the lockfile is out of date instead of quietly installing different versions. Yarn has two versions with different flags (`--immutable` in Yarn 2+, `--frozen-lockfile` in Yarn 1), so the command tries one, then the other. `npm ci` requires a `package-lock.json`; without one, `npm install` is the only option.
 - **`nodeVersionFromEngines`** is deliberately simple: it takes the first supported major version mentioned in `engines.node`. A range like `">=18"` doesn't mention one, so it returns `null` and the default (22) applies.
 
+### `readRepoFile.ts`
+
+Every file detection reads goes through this one helper. The repo is untrusted and can commit symlinks, and detection reads as root in the worker process, so a plain `readFileSync` is unsafe: `package.json -> /dev/zero` reads forever (in testing it passed 1.6 GB of memory before being killed), blocking every build and then crashing the worker, and `vite.config.js -> /proc/self/environ` would feed the worker's secrets to the config regexes, whose matches reach the build log.
+
+```ts
+import fs from "node:fs";
+import path from "node:path";
+import { isInside } from "../lib/paths.js";
+
+const MAX_BYTES = 1024 * 1024; // far above any real package.json or framework config
+
+/** A repo file's text, or null if it can't be read safely (callers treat that as "missing"). */
+export function readRepoFile(root: string, name: string): string | null {
+  try {
+    const real = fs.realpathSync(path.join(root, name));
+    if (!isInside(fs.realpathSync(root), real)) return null;
+    const stat = fs.statSync(real);
+    if (!stat.isFile() || stat.size > MAX_BYTES) return null;
+    return fs.readFileSync(real, "utf8");
+  } catch {
+    return null; // missing, or a broken or looping link
+  }
+}
+```
+
+A file is read only if, with symlinks followed, it's inside the repo, it's a regular file (not a device or pipe), and it's at most 1 MB. Symlinks that stay inside the repo still work. The `existsSync` checks elsewhere in detection (lockfiles, `index.html`) only look at whether a file exists and never read it, so they're safe as they are.
+
 ### `configParsers.ts`
 
 Config files are parsed with regexes on purpose: evaluating them would execute untrusted code on the worker host.
@@ -894,11 +922,10 @@ Config files are parsed with regexes on purpose: evaluating them would execute u
 Each function looks for one setting that moves the output folder (Vite's `build.outDir`, Next's `output: 'export'`, SvelteKit's adapter `pages`, …). `stripComments` removes comments first, so a commented-out `// outDir: "old"` isn't picked up. The limit of regexes is that a computed value (`outDir: path.join(...)`) or one imported from another file won't match. In that case the function returns `null`, the framework default applies, and if that's wrong the post-build scan finds the real folder.
 
 ```ts
-import fs from "node:fs";
-import path from "node:path";
+import { readRepoFile } from "./readRepoFile.js";
 
 function readFirst(root: string, names: string[]) {
-  for (const name of names) { const filePath = path.join(root, name); if (fs.existsSync(filePath)) return fs.readFileSync(filePath, "utf8"); }
+  for (const name of names) { const src = readRepoFile(root, name); if (src !== null) return src; }
   return null;
 }
 
@@ -1248,15 +1275,28 @@ export async function setStatus(id: string, status: DeploymentStatus, extra: Rec
 Two project settings are paths the user types: `rootDir` and `outputDir`. The pipeline resolves each one against a folder it controls and must refuse any result that lands outside that folder. This helper is the single check both places use.
 
 ```ts
+import fs from "node:fs/promises";
 import path from "node:path";
 
 /** True when `child` is `parent` itself or somewhere below it. Both must be absolute. */
 export function isInside(parent: string, child: string) {
   return child === parent || child.startsWith(parent + path.sep);
 }
+
+/** Like isInside, but for where the paths really lead: `child` must exist and, with every symlink followed, be inside `parent`. */
+export async function resolvesInside(parent: string, child: string) {
+  try {
+    const [realParent, realChild] = await Promise.all([fs.realpath(parent), fs.realpath(child)]);
+    return isInside(realParent, realChild);
+  } catch {
+    return false; // missing, or a broken or looping link
+  }
+}
 ```
 
 The `+ path.sep` is the important part. A plain `child.startsWith(parent)` accepts `/builds/abc123` as being inside `/builds/abc`, so `rootDir: "../abc123"` would reach another build's folder whenever one deployment's id is a prefix of another's. Requiring the separator means only real subfolders match. Both arguments come from `path.resolve`, which has already removed `..`, `.` and repeated or trailing separators, so plain string comparison is enough.
+
+`isInside` only compares text, which isn't enough once the path points into the cloned repo. The repo is untrusted and can commit a symlink like `site -> /`: then `<repo>/site` passes the text check while leading to the whole filesystem. `resolvesInside` follows every symlink (`realpath`) before comparing, and treats a missing path or broken link as outside. Use it for any path inside the repo once the repo exists: the project root after cloning, and the output folder after the build.
 
 ### `apps/worker/src/pipeline/context.ts`
 
@@ -1296,16 +1336,24 @@ export interface BuildContext {
 Downloads the repo into a fresh folder and records which commit is being built.
 
 ```ts
-import { simpleGit } from "simple-git";
+import { simpleGit, type SimpleGitOptions } from "simple-git";
 import fs from "node:fs/promises";
 import { CloneError } from "@shipyard/shared/errors";
 import { prisma } from "@shipyard/db";
 import type { BuildContext } from "./context.js";
+import { SANDBOX_UID, SANDBOX_GID } from "../lib/constants.js";
+
+// Run git as the build's sandbox user, so the build can write into the repo (see below).
+// Only possible when the worker is root, as in its container; `pnpm dev` on the host can't switch users.
+const asSandboxUser: Partial<SimpleGitOptions> =
+  process.getuid?.() === 0 ? { spawnOptions: { uid: SANDBOX_UID, gid: SANDBOX_GID } } : {};
 
 export async function clone(ctx: BuildContext) {
   const { project, logger } = ctx;
   await fs.rm(ctx.workDir, { recursive: true, force: true });
   await fs.mkdir(ctx.workDir, { recursive: true });
+  // git must own the folder it clones into. Safe as root: it was just created empty.
+  if (asSandboxUser.spawnOptions) await fs.chown(ctx.workDir, SANDBOX_UID, SANDBOX_GID);
 
   const url = ctx.gitToken
     ? project.repoUrl.replace("https://github.com/", `https://x-access-token:${ctx.gitToken}@github.com/`)
@@ -1313,13 +1361,13 @@ export async function clone(ctx: BuildContext) {
 
   logger.line("clone", `Cloning ${project.repoUrl} (branch ${project.branch})`);
   try {
-    await simpleGit().clone(url, ctx.workDir, ["--depth", "1", "--branch", project.branch, "--single-branch"]);
+    await simpleGit(asSandboxUser).clone(url, ctx.workDir, ["--depth", "1", "--branch", project.branch, "--single-branch"]);
   } catch (e: any) {
     // Never echo the URL back: it may contain the token.
     throw new CloneError(String(e?.message ?? e).replace(/x-access-token:[^@]+@/g, ""), project.branch);
   }
 
-  const git = simpleGit(ctx.workDir);
+  const git = simpleGit(ctx.workDir, asSandboxUser);
   const head = await git.log({ maxCount: 1 });
   const commit = head.latest;
   logger.line("clone", `Checked out ${commit?.hash.slice(0, 7)} — ${commit?.message}`);
@@ -1328,6 +1376,7 @@ export async function clone(ctx: BuildContext) {
 }
 ```
 
+- **Clone as the sandbox user.** The worker runs as root, but builds run as uid 10001 (see `containerSpec.ts`). A repo cloned by root can be read by the build but not written, so `npm ci` fails with `EACCES` (npm's exit code 243) as soon as it creates `node_modules`. Docker Desktop hides this, because its file sharing ignores ownership, so builds work on macOS and fail on Linux. Running git itself as the sandbox user means the repo belongs to the build from the start. The alternative, cloning as root and then changing owners recursively, would walk the untrusted tree with root rights: a committed symlink like `etc -> /etc` would redirect that change to the worker's own files.
 - **Start from an empty folder.** A leftover folder from a crashed earlier attempt would make `git clone` fail ("destination path already exists") or mix old files into the build.
 - **`--depth 1 --single-branch`** downloads only the latest commit of one branch. A build doesn't need history, and for a large repo this is much faster.
 - **The token goes in the URL** (Phase 3, private repos), which is how GitHub accepts an app token over HTTPS. Git error messages often repeat the URL, so the token is removed from the message before it's thrown and could reach a log.
@@ -1379,6 +1428,7 @@ The options fall into three groups, and each is kept somewhere different on purp
 
 ```ts
 import type { ContainerCreateOptions, HostConfig } from "dockerode";
+import { SANDBOX_UID, SANDBOX_GID } from "../lib/constants.js";
 
 /** The only sandbox knobs an operator may tune; `build.ts` fills them from env. */
 export interface BuildLimits {
@@ -1399,7 +1449,7 @@ export interface ContainerSpecInput {
   limits: BuildLimits;
 }
 
-const SANDBOX_USER = "1000:1000";
+const SANDBOX_USER = `${SANDBOX_UID}:${SANDBOX_GID}`;   // 10001:10001, from lib/constants.ts
 
 /** Isolation every build gets. Deliberately not configurable: change it only in code review. */
 const SANDBOX_HOST_CONFIG = {
@@ -1437,13 +1487,13 @@ export function buildContainerSpec(input: ContainerSpecInput): ContainerCreateOp
 
 **The limits are passed in** rather than read from `env`, because importing `clients.ts` opens Redis and Docker connections and exits on missing env vars, which a unit test shouldn't need. `NanoCpus` is rounded because Docker rejects a fractional value, which `BUILD_CPUS=1.3` would otherwise produce.
 
-**Environment.** `CI=true` puts tools into non-interactive mode (no prompts, no progress spinners in the logs). Note that Create React App also treats lint warnings as errors when `CI=true`. `HOME=/tmp` gives npm, pnpm and yarn a writable place for their caches: the image's file system is read-only, and user 1000 has no home folder.
+**Environment.** `CI=true` puts tools into non-interactive mode (no prompts, no progress spinners in the logs). Note that Create React App also treats lint warnings as errors when `CI=true`. `HOME=/tmp` gives npm, pnpm and yarn a writable place for their caches: the image's file system is read-only, and `/home/builder` isn't writable under it.
 
 **Sandbox settings.** Each option closes off one way a hostile or broken build could affect the host or other builds:
 
 | Setting | What it prevents |
 |---|---|
-| `User: "1000:1000"` | Running as root inside the container. |
+| `User: "10001:10001"` | Running as root inside the container. Also not 1000: on a Linux host that's usually the first login account (often with sudo), and uids carry across the container boundary, so a build, or an escape from one, would act as that person. 10001 maps to no real account. `docker/builder/Dockerfile` creates the same uid. |
 | `Memory` = `MemorySwap` | Using more than the memory limit, including by swapping to disk. Over the limit, the kernel kills the build. |
 | `NanoCpus` | Using more than `BUILD_CPUS` cores. |
 | `PidsLimit` | A fork bomb exhausting the host's process table (`BUILD_PIDS_LIMIT`, default 512). |
@@ -1471,7 +1521,7 @@ describe("buildContainerSpec", () => {
 
   // If one of these fails, a change has weakened build isolation: make sure that was intended.
   it("keeps the sandbox locked down", () => {
-    expect(spec.User).toBe("1000:1000");
+    expect(spec.User).toBe("10001:10001");
     expect(spec.HostConfig).toMatchObject({ ReadonlyRootfs: true, CapDrop: ["ALL"], SecurityOpt: ["no-new-privileges"], AutoRemove: true });
   });
   it("disables swap", () => expect(spec.HostConfig?.MemorySwap).toBe(spec.HostConfig?.Memory));
@@ -1567,7 +1617,7 @@ import path from "node:path";
 import { OutputNotFoundError } from "@shipyard/shared/errors";
 import { prisma } from "@shipyard/db";
 import { postBuildScan } from "../detect/index.js";
-import { isInside } from "../lib/paths.js";
+import { isInside, resolvesInside } from "../lib/paths.js";
 import type { BuildContext } from "./context.js";
 
 export async function resolveOutput(ctx: BuildContext) {
@@ -1586,13 +1636,15 @@ export async function resolveOutput(ctx: BuildContext) {
   if (!out) throw new OutputNotFoundError([...tried, "dist", "build", "out", "public"]);
 
   const abs = path.resolve(ctx.repoRoot, out);
+  // The build may have made the folder a symlink (`dist -> /`), which the text check above can't see.
+  if (!(await resolvesInside(ctx.repoRoot, abs))) throw new OutputNotFoundError([out]);
   ctx.outputPath = abs;
   ctx.logger.line("output", `Using ${out}/`);
   await prisma.deployment.update({ where: { id: ctx.deployment.id }, data: { resolvedOutputDir: out } });
 }
 ```
 
-1. **Stay inside the repo.** `outputDir` is user input, and a value like `../../etc` would otherwise upload files from outside the repo. It's checked with `isInside` (see `lib/paths.ts`) before anything else, so nothing outside the repo is read, even to check whether a file exists. Folders found by `postBuildScan` are top-level names inside the repo, so they don't need the check.
+1. **Stay inside the repo.** `outputDir` is user input, and a value like `../../etc` would otherwise upload files from outside the repo. It's checked with `isInside` (see `lib/paths.ts`) before anything else, so nothing outside the repo is read, even to check whether a file exists. Folders found by `postBuildScan` are top-level names inside the repo, so they don't need that check. The folder finally chosen, however it was found, is then checked again with `resolvesInside`: the build ran untrusted code and could have replaced `dist/` with a symlink to `/`, and uploading through it would publish the worker's files.
 2. **Check the expected folder.** The folder from detection (or the user's setting) is accepted only if it contains `index.html`. A folder that exists but has no `index.html` is noted in `tried`.
 3. **Fall back to the scan.** If there was no expected folder, or it didn't qualify, `postBuildScan` looks at what the build produced.
 4. **Fail with the list of what was tried**, so the error message tells the user exactly where the platform looked and that they can set "Output directory".
@@ -1617,7 +1669,14 @@ const EXCLUDE = ["**/node_modules/**", "**/.git/**", "**/.env", "**/.env.*", "**
 
 export async function upload(ctx: BuildContext) {
   const root = ctx.outputPath!;
-  const files = await fg("**/*", { cwd: root, onlyFiles: true, dot: true, ignore: EXCLUDE });
+  // Every entry, not just files, so symlinks show up and can be reported (`onlyFiles` drops them silently).
+  const listed = await fg("**/*", { cwd: root, onlyFiles: false, dot: true, ignore: EXCLUDE, followSymbolicLinks: false });
+  const files: string[] = [];
+  for (const rel of listed) {
+    const entry = await fs.promises.lstat(path.join(root, rel));
+    if (entry.isFile()) files.push(rel);
+    else if (entry.isSymbolicLink()) ctx.logger.line("warn", `Skipped ${rel}: symbolic links are not uploaded.`);
+  }
   if (!files.length) throw new Error("output directory is empty");
 
   const limit = pLimit(16);
@@ -1626,7 +1685,7 @@ export async function upload(ctx: BuildContext) {
 
   await Promise.all(files.map(rel => limit(async () => {
     const abs = path.join(root, rel);
-    const size = (await fs.promises.stat(abs)).size;
+    const size = (await fs.promises.lstat(abs)).size;
     bytes += size;
     await ctx.store.put(ctx.deployment.storagePrefix + rel, fs.createReadStream(abs), {
       contentType: contentTypeFor(rel), cacheControl: cacheControlFor(rel), contentLength: size,
@@ -1641,6 +1700,7 @@ export async function upload(ctx: BuildContext) {
 ```
 
 - **`EXCLUDE`** keeps out files that shouldn't be public even if they end up in the output folder: `.env` files (often secrets), `node_modules`, `.git`, and source maps. Source maps would let anyone read the site's original source code.
+- **Regular files only; symlinks are skipped and logged.** The worker reads the output as root, inside a container that holds its secrets. A symlink such as `env.txt -> /proc/self/environ`, committed to the repo or created by the build, would otherwise publish whatever it points at, including the worker's S3 key and database URL, at `https://<slug>.localhost/env.txt`. That needs no build at all: a plain-HTML repo can commit the link. `followSymbolicLinks: false` stops the listing from entering symlinked folders, and `lstat` (which describes the link itself, not its target) keeps only regular files.
 - **`dot: true`** includes dotfiles, because sites need some of them (for example `.well-known/` for domain verification).
 - **An empty folder is an error.** Publishing it would replace a working site with a blank one.
 - **`pLimit(16)`** uploads 16 files at a time. One at a time is slow for sites with thousands of files; all at once would open thousands of connections and file handles.
@@ -1728,7 +1788,7 @@ import { prisma } from "@shipyard/db";
 import { BuildCancelledError, RootDirError, toUserMessage } from "@shipyard/shared/errors";
 import { env, log, storage } from "../lib/clients.js";
 import { BuildLogger } from "../lib/logs.js";
-import { isInside } from "../lib/paths.js";
+import { isInside, resolvesInside } from "../lib/paths.js";
 import { setStatus } from "../lib/status.js";
 import type { BuildContext } from "./context.js";
 import { clone } from "./clone.js";
@@ -1757,6 +1817,9 @@ export async function runPipeline(deploymentId: string, signal: AbortSignal) {
     if (!isInside(workDir, ctx.repoRoot)) throw new RootDirError(deployment.project.rootDir);
     await setStatus(deploymentId, "cloning", { startedAt: new Date() });
     await clone(ctx);
+    // Checked again now the repo exists: a committed symlink (`site -> /`) passes the text check above.
+    // Unchecked, the build would bind-mount wherever it leads, which Docker resolves on the host.
+    if (!(await resolvesInside(workDir, ctx.repoRoot))) throw new RootDirError(deployment.project.rootDir);
     await setStatus(deploymentId, "detecting");
     await detect(ctx);
     await setStatus(deploymentId, "building");

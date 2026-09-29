@@ -1192,7 +1192,7 @@ A **pre-built** image is used rather than installing tools at build time because
 - pinning the image gives reproducible builds — the same repo built next month uses the same toolchain;
 - one image per supported Node major (`node20`, `node22`, `node24`) lets projects choose a runtime without the platform maintaining a version manager. `node22` is the default: Node 20 left its maintenance window in April 2026, so it is offered only for projects that still pin it.
 
-Running as a non-root user (`builder`, uid 1000) means that even if a build escapes into the container's filesystem it can't modify system paths, and files it writes to the mounted workspace are owned by a predictable uid the worker can clean up.
+Running as a non-root user (`builder`, uid 10001) means that even if a build escapes into the container's filesystem it can't modify system paths, and files it writes to the mounted workspace are owned by a predictable uid the worker can clean up.
 
 ### What's installed and why
 
@@ -1230,9 +1230,10 @@ RUN apt-get update \
  # pnpm 12 fetches its native binary on first run; do it now so it lands in the image.
  && pnpm --version \
  && chmod -R a+rX "$COREPACK_HOME" \
- # The node image already has uid 1000 (`node`); rename it rather than add a second user.
- && groupmod -n builder node \
- && usermod -l builder -d /home/builder -m -s /bin/sh node \
+ # A dedicated uid, not the image's `node` (1000): on a Linux host 1000 is usually a
+ # real login account. Must match SANDBOX_UID in apps/worker/src/lib/constants.ts.
+ && groupadd -g 10001 builder \
+ && useradd -u 10001 -g builder -d /home/builder -m -s /bin/sh builder \
  && mkdir -p /app /cache && chown builder:builder /app /cache
 
 USER builder

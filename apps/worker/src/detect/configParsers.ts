@@ -6,14 +6,13 @@
  * a computed value (`outDir: path.join(...)`) isn't found; the build still
  * works, and `postBuildScan` finds the output afterwards.
  */
-import fs from "node:fs";
-import path from "node:path";
+import { readRepoFile } from "./readRepoFile.js";
 
-/** Contents of the first file in `names` that exists under `root`, or `null`. */
+/** Contents of the first file in `names` that can be read under `root` (see `readRepoFile`), or `null`. */
 function readFirst(root: string, names: string[]) {
   for (const name of names) {
-    const filePath = path.join(root, name);
-    if (fs.existsSync(filePath)) return fs.readFileSync(filePath, "utf8");
+    const src = readRepoFile(root, name);
+    if (src !== null) return src;
   }
   return null;
 }

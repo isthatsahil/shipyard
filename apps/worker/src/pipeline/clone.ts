@@ -1,4 +1,4 @@
-import { simpleGit } from "simple-git";
+import { simpleGit, type SimpleGitOptions } from "simple-git";
 import fs from "node:fs/promises";
 import { CloneError } from "@shipyard/shared/errors";
 import { prisma } from "@shipyard/db";
@@ -7,10 +7,30 @@ import {
   GITHUB_URL,
   GITHUB_TOKEN_RE,
   githubAuthUrl,
+  SANDBOX_UID,
+  SANDBOX_GID,
 } from "../lib/constants.js";
 
 /**
- * First pipeline step: puts a fresh copy of the project's repo in `ctx.workDir`.
+ * Runs git as the build's sandbox user, so every cloned file belongs to the
+ * user the build container runs as, and the build can write into the repo.
+ *
+ * Cloning as that user, rather than cloning as root and changing owners
+ * afterwards, means nothing ever walks the untrusted tree with root rights:
+ * a committed symlink like `etc -> /etc` can't redirect a recursive chown.
+ *
+ * Only possible when the worker is root, as it is in its container. A worker
+ * run on the host (`pnpm dev`) can't switch users; on Docker Desktop that's
+ * harmless, because its file sharing ignores ownership.
+ */
+const asSandboxUser: Partial<SimpleGitOptions> =
+  process.getuid?.() === 0
+    ? { spawnOptions: { uid: SANDBOX_UID, gid: SANDBOX_GID } }
+    : {};
+
+/**
+ * First pipeline step: puts a fresh copy of the project's repo in `ctx.workDir`,
+ * owned by the build's sandbox user.
  *
  * Empties the work directory, then shallow-clones only the latest commit of
  * `project.branch`. If `ctx.gitToken` is set (private repos), it is added to
@@ -27,6 +47,10 @@ export async function clone(ctx: BuildContext) {
   const { project, logger } = ctx;
   await fs.rm(ctx.workDir, { recursive: true, force: true });
   await fs.mkdir(ctx.workDir, { recursive: true });
+  // git runs as the sandbox user, so it must own the folder it clones into.
+  // Safe as root: the folder was just created empty, so there's nothing to follow.
+  if (asSandboxUser.spawnOptions)
+    await fs.chown(ctx.workDir, SANDBOX_UID, SANDBOX_GID);
 
   const url = ctx.gitToken
     ? project.repoUrl.replace(GITHUB_URL, githubAuthUrl(ctx.gitToken))
@@ -34,7 +58,7 @@ export async function clone(ctx: BuildContext) {
 
   logger.line("clone", `Cloning ${project.repoUrl} (branch ${project.branch})`);
   try {
-    await simpleGit().clone(url, ctx.workDir, [
+    await simpleGit(asSandboxUser).clone(url, ctx.workDir, [
       "--depth",
       "1",
       "--branch",
@@ -47,7 +71,7 @@ export async function clone(ctx: BuildContext) {
     throw new CloneError(message.replace(GITHUB_TOKEN_RE, ""), project.branch);
   }
 
-  const git = simpleGit(ctx.workDir);
+  const git = simpleGit(ctx.workDir, asSandboxUser);
   const head = await git.log({ maxCount: 1 });
   const commit = head.latest;
   logger.line(

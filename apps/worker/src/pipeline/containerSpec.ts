@@ -1,4 +1,5 @@
 import type { ContainerCreateOptions, HostConfig } from "dockerode";
+import { SANDBOX_UID, SANDBOX_GID } from "../lib/constants.js";
 
 /**
  * Resource limits for one build container. These are the only sandbox knobs
@@ -35,9 +36,9 @@ export interface ContainerSpecInput {
 
 /**
  * Container user. Builds never run as root, so a container escape starts
- * without root privileges.
+ * without root privileges. See {@link SANDBOX_UID} for why this uid.
  */
-const SANDBOX_USER = "1000:1000";
+const SANDBOX_USER = `${SANDBOX_UID}:${SANDBOX_GID}`;
 
 /**
  * Isolation every build container gets, whatever the host or project.

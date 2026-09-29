@@ -8,7 +8,7 @@ import {
 } from "@shipyard/shared/errors";
 import { env, log, storage } from "../lib/clients.js";
 import { BuildLogger } from "../lib/logs.js";
-import { isInside } from "../lib/paths.js";
+import { isInside, resolvesInside } from "../lib/paths.js";
 import { setStatus } from "../lib/status.js";
 import type { BuildContext } from "./context.js";
 import { clone } from "./clone.js";
@@ -66,6 +66,11 @@ export async function runPipeline(deploymentId: string, signal: AbortSignal) {
       throw new RootDirError(deployment.project.rootDir);
     await setStatus(deploymentId, "cloning", { startedAt: new Date() });
     await clone(ctx);
+    // Checked again now the repo exists: a committed symlink (`site -> /`) passes
+    // the text check above. Unchecked, the build would bind-mount wherever it
+    // leads, which Docker resolves on the host.
+    if (!(await resolvesInside(workDir, ctx.repoRoot)))
+      throw new RootDirError(deployment.project.rootDir);
     await setStatus(deploymentId, "detecting");
     await detect(ctx);
     await setStatus(deploymentId, "building");

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Framework, PackageManager } from "./types.js";
+import { readRepoFile } from "./readRepoFile.js";
 
 /** The parts of `package.json` detection needs. */
 export interface PkgInfo {
@@ -19,9 +20,9 @@ export interface PkgInfo {
  * @throws {SyntaxError} If the file exists but isn't valid JSON.
  */
 export function readPackageJson(root: string): PkgInfo {
-  const pkgPath = path.join(root, "package.json");
-  if (!fs.existsSync(pkgPath)) return { exists: false, deps: {}, scripts: {} };
-  const json = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+  const src = readRepoFile(root, "package.json");
+  if (src === null) return { exists: false, deps: {}, scripts: {} };
+  const json = JSON.parse(src);
   return {
     exists: true,
     deps: { ...(json.dependencies ?? {}), ...(json.devDependencies ?? {}) },

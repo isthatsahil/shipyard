@@ -23,7 +23,7 @@ describe("buildContainerSpec", () => {
   // These are the sandbox guarantees. If one of these fails, a change has
   // weakened build isolation: make sure that was intended.
   it("keeps the sandbox locked down", () => {
-    expect(spec.User).toBe("1000:1000");
+    expect(spec.User).toBe("10001:10001");
     expect(spec.HostConfig).toMatchObject({
       ReadonlyRootfs: true,
       CapDrop: ["ALL"],
