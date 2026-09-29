@@ -25,7 +25,8 @@ services:
       POSTGRES_PASSWORD: shipyard
       POSTGRES_DB: shipyard
     volumes: [pgdata:/var/lib/postgresql/data]
-    ports: ["5432:5432"]
+    # 127.0.0.1: reachable from this machine (migrations, `pnpm dev`), not the LAN.
+    ports: ["127.0.0.1:5432:5432"]
     healthcheck:
       {
         test: ["CMD-SHELL", "pg_isready -U shipyard"],
@@ -37,7 +38,7 @@ services:
     image: redis:7
     command: ["redis-server", "--appendonly", "yes"]
     volumes: [redisdata:/data]
-    ports: ["6379:6379"]
+    ports: ["127.0.0.1:6379:6379"]
     healthcheck:
       { test: ["CMD", "redis-cli", "ping"], interval: 5s, retries: 10 }
 
@@ -46,7 +47,7 @@ services:
     command: server /data --console-address ":9001"
     environment: { MINIO_ROOT_USER: minio, MINIO_ROOT_PASSWORD: minio12345 }
     volumes: [miniodata:/data]
-    ports: ["9000:9000", "9001:9001"]
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
     healthcheck:
       { test: ["CMD", "mc", "ready", "local"], interval: 5s, retries: 10 }
 
@@ -66,7 +67,7 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
-    ports: ["4000:4000"]
+    ports: ["127.0.0.1:4000:4000"]
 
   worker:
     build: { context: .., dockerfile: apps/worker/Dockerfile }
@@ -82,6 +83,8 @@ services:
       # compose resolves relative to this file) so they can't drift apart.
       # ${PWD} is the repo root under `pnpm infra:up`.
       BUILDS_HOST_PATH: ${PWD}/data/builds
+      # Builds reach the internet only through this proxy (see build-proxy below).
+      BUILD_HTTP_PROXY: http://build-proxy:3128
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${PWD}/data/builds:/builds
@@ -89,7 +92,18 @@ services:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
       minio-init: { condition: service_completed_successfully }
-    networks: [default, build_egress]
+      build-proxy: { condition: service_started }
+    # Not on build_egress: the worker drives builds through the Docker API, never
+    # over the network, so builds have no reason to reach it.
+
+  build-proxy:
+    image: ubuntu/squid:6.13-25.04_beta
+    logging: *logging
+    volumes: ["./build-proxy/squid.conf:/etc/squid/squid.conf:ro"]
+    # build_egress to take requests from builds; proxy_out, and only that, to
+    # reach the internet. Deliberately not on `default`, so it can't even
+    # resolve postgres, redis or minio; squid.conf also refuses private IPs.
+    networks: [build_egress, proxy_out]
 
   router:
     build: { context: .., dockerfile: apps/router/Dockerfile }
@@ -98,7 +112,7 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
-    ports: ["4001:4001"]
+    ports: ["127.0.0.1:4001:4001"]
     # /__health, not /health — the router serves user sites on wildcard
     # subdomains, so a bare /health would collide with a deployed site's own.
     healthcheck:
@@ -114,7 +128,7 @@ services:
     build: { context: .., dockerfile: apps/web/Dockerfile, target: dev }
     # Host edits hot-reload inside the container.
     volumes: [../apps/web/src:/repo/apps/web/src]
-    ports: ["5173:5173"]
+    ports: ["127.0.0.1:5173:5173"]
 
   caddy:
     image: caddy:2
@@ -127,9 +141,15 @@ services:
 networks:
   default: {}
   build_egress:
-    # Builder containers join only this network: they can reach the internet
-    # but not postgres/redis/minio, which live on `default`.
+    # The only network build containers join. `internal`: no route to the host,
+    # its published ports, other networks, or the internet. The one way out is
+    # build-proxy, which allows public hosts only. Without `internal`, builds
+    # could reach postgres/redis/minio through the host's published ports.
     name: shipyard_build_egress
+    driver: bridge
+    internal: true
+  proxy_out:
+    # build-proxy's route to the internet. Nothing else joins it.
     driver: bridge
 
 volumes:

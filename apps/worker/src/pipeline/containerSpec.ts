@@ -15,8 +15,27 @@ export interface BuildLimits {
   pidsLimit: number;
   /** Size of the in-memory `/tmp`, in Docker's format, e.g. `"1g"` or `"512m"`. */
   tmpSize: string;
-  /** Docker network the container joins: internet access, no internal services. */
+  /** Docker network the container joins: `internal`, so no direct route anywhere. */
   network: string;
+  /** Egress proxy URL, the build's only way to the internet. Unset: no internet. */
+  proxyUrl?: string;
+}
+
+/**
+ * Env vars that send a build's traffic through the egress proxy. Package
+ * managers and tools read different names: npm, pnpm, git and corepack use
+ * HTTP(S)_PROXY in either case, Yarn 2+ only its own YARN_ ones, and Node's
+ * built-in `fetch` (used by some build scripts) only with NODE_USE_ENV_PROXY,
+ * which needs Node 22.21+ or 24; on Node 20 such scripts get no network.
+ */
+function proxyEnv(proxyUrl?: string) {
+  if (!proxyUrl) return [];
+  const names = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"];
+  names.push("YARN_HTTP_PROXY", "YARN_HTTPS_PROXY");
+  return [
+    ...names.map((name) => `${name}=${proxyUrl}`),
+    "NODE_USE_ENV_PROXY=1",
+  ];
 }
 
 /** Everything that differs from one build to the next. */
@@ -72,7 +91,12 @@ export function buildContainerSpec(
     Cmd: ["sh", "-c", input.cmd],
     WorkingDir: "/app",
     User: SANDBOX_USER,
-    Env: [...input.envVars, "CI=true", "HOME=/tmp"],
+    Env: [
+      ...input.envVars,
+      "CI=true",
+      "HOME=/tmp",
+      ...proxyEnv(limits.proxyUrl),
+    ],
     Labels: {
       "shipyard.deployment": input.deploymentId,
       "shipyard.project": input.projectId,

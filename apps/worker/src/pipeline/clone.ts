@@ -71,7 +71,14 @@ export async function clone(ctx: BuildContext) {
     throw new CloneError(message.replace(GITHUB_TOKEN_RE, ""), project.branch);
   }
 
-  const git = simpleGit(ctx.workDir, asSandboxUser);
+  // safe.directory: on Docker Desktop the bind-mounted clone doesn't show the
+  // sandbox user as owner, and git refuses to read a repo someone else owns
+  // ("dubious ownership"). Trusting this one folder is safe: git created its
+  // .git a moment ago, and a clone can't bring the repo's own .git/config.
+  const git = simpleGit(ctx.workDir, {
+    ...asSandboxUser,
+    config: [`safe.directory=${ctx.workDir}`],
+  });
   const head = await git.log({ maxCount: 1 });
   const commit = head.latest;
   logger.line(

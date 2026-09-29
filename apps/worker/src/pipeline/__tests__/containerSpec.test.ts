@@ -63,4 +63,20 @@ describe("buildContainerSpec", () => {
       "shipyard.project": "p1",
     });
   });
+
+  it("routes traffic through the egress proxy when one is set", () => {
+    const proxied = buildContainerSpec({
+      ...input,
+      limits: { ...input.limits, proxyUrl: "http://build-proxy:3128" },
+    });
+    expect(proxied.Env).toEqual(
+      expect.arrayContaining([
+        "HTTPS_PROXY=http://build-proxy:3128",
+        "https_proxy=http://build-proxy:3128",
+        "YARN_HTTPS_PROXY=http://build-proxy:3128",
+        "NODE_USE_ENV_PROXY=1",
+      ]),
+    );
+    // Without a proxy nothing is added (see the test above).
+  });
 });

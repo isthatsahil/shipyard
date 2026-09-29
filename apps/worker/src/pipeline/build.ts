@@ -47,6 +47,7 @@ export async function build(ctx: BuildContext) {
         pidsLimit: env.BUILD_PIDS_LIMIT,
         tmpSize: env.BUILD_TMP_SIZE,
         network: env.BUILD_NETWORK,
+        proxyUrl: env.BUILD_HTTP_PROXY,
       },
     }),
   );

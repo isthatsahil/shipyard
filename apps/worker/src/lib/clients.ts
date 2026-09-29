@@ -23,6 +23,9 @@ export const env = loadEnv({
   BUILDS_DIR: z.string().default("/builds"), // path inside the worker container
   BUILDS_HOST_PATH: z.string(), // same directory as seen by the Docker daemon
   BUILD_NETWORK: z.string().default("shipyard_build_egress"),
+  // Egress proxy for builds, e.g. http://build-proxy:3128. The build network is
+  // `internal`, so without it builds have no internet access at all.
+  BUILD_HTTP_PROXY: z.url().optional(),
   BUILDER_IMAGE_PREFIX: z.string().default("shipyard/builder:node"),
 });
 
