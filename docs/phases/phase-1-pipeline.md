@@ -1149,6 +1149,7 @@ export const env = loadEnv({
   BUILDS_DIR: z.string().default("/builds"),          // path inside the worker container
   BUILDS_HOST_PATH: z.string(),                        // same directory as seen by the Docker daemon
   BUILD_NETWORK: z.string().default("shipyard_build_egress"),
+  BUILD_HTTP_PROXY: z.url().optional(),   // egress proxy, e.g. http://build-proxy:3128
   BUILDER_IMAGE_PREFIX: z.string().default("shipyard/builder:node"),
 });
 
@@ -1168,7 +1169,8 @@ The build limits are environment variables so CI can shorten the timeout (Step 7
 | `BUILD_MEMORY_BYTES`, `BUILD_CPUS` | Per-container limits, so one heavy build can't starve the others or the host. |
 | `BUILD_PIDS_LIMIT`, `BUILD_TMP_SIZE` | Maximum processes (stops fork bombs) and the size of the in-memory `/tmp`. Raise the `/tmp` size for builds that unpack large toolchains there. |
 | `BUILDS_DIR`, `BUILDS_HOST_PATH` | The shared folder where repos are cloned, as two paths (see below). |
-| `BUILD_NETWORK` | The Docker network build containers join: internet access for `npm install`, no route to Postgres, Redis or MinIO (Phase 0). |
+| `BUILD_NETWORK` | The Docker network build containers join. It's `internal` (Phase 0): no direct route to anything, including Postgres, Redis, MinIO and the host. |
+| `BUILD_HTTP_PROXY` | The egress proxy on that network (`build-proxy`), the build's only way to the internet, for public hosts only. Unset means builds get no internet at all. |
 | `BUILDER_IMAGE_PREFIX` | Prefix of the builder image; the Node version is appended (`…node22`). |
 
 `docker` talks to the host's Docker daemon through the mounted socket. Containers the worker creates are **siblings** of the worker container on the host, not children inside it ("Docker-out-of-Docker"). That's why paths need translating: when the worker asks Docker to mount a folder, Docker looks for that folder on the host, not inside the worker container.
@@ -1367,7 +1369,9 @@ export async function clone(ctx: BuildContext) {
     throw new CloneError(String(e?.message ?? e).replace(/x-access-token:[^@]+@/g, ""), project.branch);
   }
 
-  const git = simpleGit(ctx.workDir, asSandboxUser);
+  // safe.directory: on Docker Desktop the bind-mounted clone doesn't show the sandbox user as owner,
+  // and git refuses "dubious ownership". Safe: git made this .git just now; a clone can't bring its own .git/config.
+  const git = simpleGit(ctx.workDir, { ...asSandboxUser, config: [`safe.directory=${ctx.workDir}`] });
   const head = await git.log({ maxCount: 1 });
   const commit = head.latest;
   logger.line("clone", `Checked out ${commit?.hash.slice(0, 7)} — ${commit?.message}`);
@@ -1436,7 +1440,15 @@ export interface BuildLimits {
   cpus: number;          // fractions allowed, e.g. 1.5
   pidsLimit: number;
   tmpSize: string;       // Docker format, e.g. "1g" or "512m"
-  network: string;
+  network: string;       // `internal`: no direct route anywhere
+  proxyUrl?: string;     // egress proxy, the only way out; unset = no internet
+}
+
+/** Proxy env vars, under every name the tools read (see the table below). */
+function proxyEnv(proxyUrl?: string) {
+  if (!proxyUrl) return [];
+  const names = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "YARN_HTTP_PROXY", "YARN_HTTPS_PROXY"];
+  return [...names.map((name) => `${name}=${proxyUrl}`), "NODE_USE_ENV_PROXY=1"];
 }
 
 export interface ContainerSpecInput {
@@ -1466,7 +1478,7 @@ export function buildContainerSpec(input: ContainerSpecInput): ContainerCreateOp
     Cmd: ["sh", "-c", input.cmd],
     WorkingDir: "/app",
     User: SANDBOX_USER,
-    Env: [...input.envVars, "CI=true", "HOME=/tmp"],
+    Env: [...input.envVars, "CI=true", "HOME=/tmp", ...proxyEnv(limits.proxyUrl)],
     Labels: { "shipyard.deployment": input.deploymentId, "shipyard.project": input.projectId },
     AttachStdout: true, AttachStderr: true, Tty: false,
     HostConfig: {
@@ -1499,7 +1511,7 @@ export function buildContainerSpec(input: ContainerSpecInput): ContainerCreateOp
 | `PidsLimit` | A fork bomb exhausting the host's process table (`BUILD_PIDS_LIMIT`, default 512). |
 | `ReadonlyRootfs` + `Tmpfs /tmp` | Changing the image. The only writable places are the mounted repo and an in-memory `/tmp` (`BUILD_TMP_SIZE`, default 1 GB). |
 | `CapDrop: ["ALL"]`, `no-new-privileges` | Using Linux capabilities (raw sockets, mount, …) or gaining privileges through setuid binaries. |
-| `NetworkMode: BUILD_NETWORK` | Reaching Postgres, Redis or MinIO. The build can reach the internet to download packages. |
+| `NetworkMode: BUILD_NETWORK` + proxy env | Reaching Postgres, Redis, MinIO, the host or the cloud metadata endpoint. The network is `internal`; the build reaches public hosts (npm, GitHub) only through `build-proxy`, via `HTTP(S)_PROXY`, the `YARN_` variants (Yarn 2+ ignores the standard names), and `NODE_USE_ENV_PROXY=1` for Node's own `fetch` (Node 22.21+ and 24; on Node 20, scripts calling `fetch` directly get no network). |
 | `AutoRemove` | Stopped containers piling up. Docker deletes the container when it exits. |
 | `Labels` | Losing track of containers. Phase 4's cleanup job finds leftover build containers by label. |
 
@@ -1536,6 +1548,10 @@ describe("buildContainerSpec", () => {
     expect(spec.Env).toEqual(["API_URL=https://example.com", "CI=true", "HOME=/tmp"]);
     expect(spec.Labels).toEqual({ "shipyard.deployment": "d1", "shipyard.project": "p1" });
   });
+  it("routes traffic through the egress proxy when one is set", () => {
+    const proxied = buildContainerSpec({ ...input, limits: { ...input.limits, proxyUrl: "http://build-proxy:3128" } });
+    expect(proxied.Env).toEqual(expect.arrayContaining(["HTTPS_PROXY=http://build-proxy:3128", "YARN_HTTPS_PROXY=http://build-proxy:3128", "NODE_USE_ENV_PROXY=1"]));
+  });
 });
 ```
 
@@ -1570,6 +1586,7 @@ export async function build(ctx: BuildContext) {
       pidsLimit: env.BUILD_PIDS_LIMIT,
       tmpSize: env.BUILD_TMP_SIZE,
       network: env.BUILD_NETWORK,
+      proxyUrl: env.BUILD_HTTP_PROXY,
     },
   }));
 

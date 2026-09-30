@@ -364,6 +364,8 @@ Build the extra images: `pnpm builder:build:all` (node20 and node24; node22 is a
 
 ### Dashboard
 
+Login, signup, the sign-in error state and the account menu are specified in [UI design §5.6](ui-design.md#56-auth--login-signup-phase-3); components (`AuthLayout`, `GitHubButton`, `ScopeList`, `AccountMenu`) and the auth loader are in [UI implementation §4.3 and §6.8](ui-implementation.md#68-auth-phase-3).
+
 Add a **Settings** tab on the project page: branch, root dir, install/build/output, Node version select, SPA toggle (`PATCH`), and an env-var editor (key/value rows, masked values, "Save" → `PUT`, with the note "Redeploy to apply"). Show the webhook status and, when `webhookId` is null, the manual instructions.
 
 ---

@@ -196,9 +196,11 @@ Measure: `vite-react` cold vs warm `npm ci` should drop from tens of seconds to 
 ## Step 6 — Extra sandbox tightening (optional, cheap)
 
 - `Ulimits: [{ Name: "nofile", Soft: 65536, Hard: 65536 }, { Name: "fsize", Soft: 2 * 1024 ** 3, Hard: 2 * 1024 ** 3 }]` — cap open files and single-file size.
-- `StorageOpt: { size: "5G" }` where the storage driver supports it, or check the output size in `upload.ts` and fail above a configurable `MAX_OUTPUT_BYTES` (default 500 MB).
+- **Output size (recommended, not optional):** check the total in `upload.ts` and fail above a configurable `MAX_OUTPUT_BYTES` (default 500 MB), or use `StorageOpt: { size: "5G" }` where the storage driver supports it. Without it, one build can fill the bucket.
+- **Clone limits (recommended):** a timeout on the worker's clone (e.g. 2 min, aborting `simple-git` through its `abort` option) and a size cap (`--filter=blob:limit=…` as Phase 2's detect preview does, plus a check of the work folder's size after cloning). Today a huge repo can fill the host's disk or hold a build slot until the process is killed.
+- **Log cap (recommended):** limit lines per build in `BuildLogger` (e.g. 50,000): `LTRIM` the Redis list and write one "log truncated" line. A build printing without end otherwise fills Redis's memory, and Redis is also the job queue.
 - Seccomp: Docker's default profile is adequate; don't set `--privileged`, ever.
-- Egress allow-list: if you need to block crypto-mining or exfiltration, run a small squid/tinyproxy on `build_egress` with an allow-list (`registry.npmjs.org`, `github.com`, `*.githubusercontent.com`, `registry.yarnpkg.com`) and set `HTTP_PROXY`/`HTTPS_PROXY` in the container while switching `build_egress` to `internal: true`. Some builds legitimately fetch fonts or Puppeteer binaries, so make it a per-project opt-in.
+- Egress allow-list (optional tightening): builds already reach the internet only through `build-proxy` (Phase 0), which refuses private and metadata addresses but allows any public host. To also block crypto-mining or exfiltration to public hosts, add an allow-list to `docker/build-proxy/squid.conf` (`registry.npmjs.org`, `github.com`, `*.githubusercontent.com`, `registry.yarnpkg.com`). Some builds legitimately fetch fonts or Puppeteer binaries, so make it a per-project opt-in.
 
 ---
 

@@ -12,6 +12,8 @@ Companion to [deploy-platform-work-plan.md](deploy-platform-work-plan.md). That 
 | 5 | [Production serving](docs/phases/phase-5-production.md) | Wildcard + on-demand TLS via Caddy, custom domains with DNS verification, CDN purge, brotli/gzip pre-compression, retention GC, CI/CD for the platform | ~1 week |
 | 6 | [Operations & stretch](docs/phases/phase-6-operations.md) | Structured logs, Prometheus metrics + alerts, PR preview deployments, CLI upload path, teams/quotas/badges, runbook | ongoing |
 
+The visual spec for every screen (landing, dashboard, auth, error pages, router 404) lives in [UI design](docs/phases/ui-design.md), and how to build it (app structure, component catalogue, implementation notes) in [UI implementation](docs/phases/ui-implementation.md). Phases 2 and 3 build their UI to them.
+
 ## Repository layout produced by the guides
 
 ```

@@ -211,6 +211,8 @@ Rollback is not a separate endpoint — the UI calls `promote` on an older row.
 
 Dependencies: `react-router-dom`, `@tanstack/react-query`, `clsx`, `date-fns`. Tailwind already set up in Phase 0.
 
+**Look and layout come from [UI design](ui-design.md); structure and components from [UI implementation](ui-implementation.md).** The snippets below show the data flow (queries, SSE, mutations) with plain Tailwind; build the markup from the shadcn components, tokens and page specs in those files instead. In particular, batch `useLogStream` updates per animation frame ([UI implementation §7.1](ui-implementation.md#71-log-streaming-and-follow-mode)) and use `react-router` v7 and `Intl` formatters in place of `react-router-dom` and `date-fns`. It also adds screens not shown here: the landing page at `/`, error pages, and pagination on the project list.
+
 **i18n.** All UI text goes through react-i18next (`src/i18n/`): `t("key")` for UI copy in `locales/<lng>/common.json`, and `formatUserMessage(i18n, { code, params }, fallback)` for anything the server sends (API errors and `deployment.errorCode`). Don't render `error.message` or `deployment.error` directly. Dates and sizes use `Intl.DateTimeFormat`/`Intl.NumberFormat` with `i18n.language`. The snippets below keep inline English for brevity; move each string into `common.json` when you build the page.
 
 ### `src/api.ts`
@@ -502,7 +504,7 @@ export function ProjectPage() {
 }
 ```
 
-`src/pages/ProjectList.tsx` is a straightforward list of `api.projects()` rows with name, slug, last status and a "Visit" link; `src/main.tsx` wires `QueryClientProvider` and the four routes (`/`, `/new`, `/projects/:id`, `/deployments/:id`).
+`src/pages/ProjectList.tsx` is a paginated grid of project cards (spec: [UI design §5.2](ui-design.md#52-project-list--projects)); `src/main.tsx` wires `QueryClientProvider` and the routes: `/` (landing), `/projects`, `/new`, `/projects/:id`, `/deployments/:id`, and a `*` 404. See [UI design §4](ui-design.md#4-routes).
 
 ### CORS
 

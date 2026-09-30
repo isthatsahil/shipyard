@@ -431,6 +431,14 @@ Set `BUILDER_IMAGE_PREFIX=ghcr.io/<org>/shipyard/builder:node` on the prod worke
 
 **Host hardening:** the VM exposes only 80/443/22; Postgres/Redis/MinIO bind to the Docker network only; `ufw` default deny; unattended-upgrades on.
 
+- **Credentials:** a Redis password (`requirepass`, and `REDIS_URL=redis://:<password>@redis:6379`) and non-default Postgres and MinIO credentials, all from `docker/.env`. The dev defaults are public.
+- **The worker's Docker socket is root on the host.** Anything that takes over the worker process (a bug in it, or in a dependency) can start a privileged container and own the machine. Options, in rising order of protection:
+  1. A socket proxy (e.g. `tecnativa/docker-socket-proxy`) that exposes only the container create/start/attach/wait/kill/delete endpoints. It blocks most of the Docker API, but it can't check a create request's *contents*, so a compromised worker could still bind-mount `/`. It raises the bar; it doesn't contain.
+  2. Run build containers under a user-space kernel: gVisor (`runtime: runsc`) or Sysbox. Build code then never touches the host kernel, so a kernel bug doesn't turn into a host escape. This is the main protection for the builds themselves, which run untrusted code.
+  3. Rootless Docker for the daemon the worker talks to, so even full control of that daemon is only an unprivileged user on the host.
+
+  Do 2 before accepting builds from people you don't know; add 1 or 3 for the worker itself.
+
 ---
 
 ## Checklist

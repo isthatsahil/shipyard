@@ -1293,7 +1293,8 @@ Compose describes the whole local environment as one file so a new contributor r
 | `minio-init` | One-shot container that creates the `deployments` bucket. S3 buckets don't auto-create, and the worker's first upload would fail without it; `depends_on: service_completed_successfully` sequences it |
 | `caddy` | Reverse proxy and TLS. Locally it terminates HTTPS with an internal CA and routes `api.localhost`, `app.localhost` and `*.localhost` to the right container — the same wildcard-subdomain behaviour production needs, so routing bugs show up early |
 | `api`, `worker`, `router`, `web` | The four apps, built from their Dockerfiles |
-| `build_egress` network | A second Docker network that only the worker (and the build containers it spawns) join. Build containers are attached to *this* network only, so they can reach npm registries on the internet but cannot open a socket to `postgres`, `redis` or `minio`, which live on `default`. This is what stops a malicious build script from reading the platform database |
+| `build_egress` network + `build-proxy` | The only network build containers join. It is `internal`: no route to the host, its published ports, other networks, or the internet. The one way out is `build-proxy` (Squid), which forwards to public hosts only and refuses loopback, private, link-local (the cloud metadata address `169.254.169.254`) and Docker addresses, checking the IP a name resolves to. A separate network alone isn't enough: it only hides service *names*, and a build could still reach Postgres, Redis and MinIO through the host's published ports (tested: Redis answered `PONG` from a build). |
+| Ports bound to `127.0.0.1` | Postgres, Redis and MinIO use default credentials in dev. Bound to all interfaces, anyone on the same Wi-Fi could connect. `127.0.0.1` keeps them reachable from this machine (migrations, `pnpm dev`) only. |
 
 Two settings on the worker deserve explanation:
 
@@ -1352,14 +1353,14 @@ services:
       POSTGRES_PASSWORD: shipyard
       POSTGRES_DB: shipyard
     volumes: [pgdata:/var/lib/postgresql/data]
-    ports: ["5432:5432"]
+    ports: ["127.0.0.1:5432:5432"]   # this machine only, not the LAN
     healthcheck: { test: ["CMD-SHELL", "pg_isready -U shipyard"], interval: 5s, retries: 10 }
 
   redis:
     image: redis:7
     command: ["redis-server", "--appendonly", "yes"]
     volumes: [redisdata:/data]
-    ports: ["6379:6379"]
+    ports: ["127.0.0.1:6379:6379"]
     healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 5s, retries: 10 }
 
   minio:
@@ -1367,7 +1368,7 @@ services:
     command: server /data --console-address ":9001"
     environment: { MINIO_ROOT_USER: minio, MINIO_ROOT_PASSWORD: minio12345 }
     volumes: [miniodata:/data]
-    ports: ["9000:9000", "9001:9001"]
+    ports: ["127.0.0.1:9000:9000", "127.0.0.1:9001:9001"]
     healthcheck: { test: ["CMD", "mc", "ready", "local"], interval: 5s, retries: 10 }
 
   minio-init:
@@ -1385,7 +1386,7 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
-    ports: ["4000:4000"]
+    ports: ["127.0.0.1:4000:4000"]
 
   worker:
     build: { context: .., dockerfile: apps/worker/Dockerfile }
@@ -1394,6 +1395,7 @@ services:
       BUILD_CONCURRENCY: 2
       BUILD_TIMEOUT_MS: 900000
       BUILDS_HOST_PATH: ${PWD}/data/builds   # host path of the shared volume (see Phase 1)
+      BUILD_HTTP_PROXY: http://build-proxy:3128   # builds' only way to the internet
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./data/builds:/builds
@@ -1401,7 +1403,14 @@ services:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
       minio-init: { condition: service_completed_successfully }
-    networks: [default, build_egress]
+      build-proxy: { condition: service_started }
+    # Not on build_egress: the worker drives builds through the Docker API, never over the network.
+
+  build-proxy:
+    image: ubuntu/squid:6.13-25.04_beta
+    volumes: ["./build-proxy/squid.conf:/etc/squid/squid.conf:ro"]
+    # Not on `default`, so it can't even resolve postgres/redis/minio.
+    networks: [build_egress, proxy_out]
 
   router:
     build: { context: .., dockerfile: apps/router/Dockerfile }
@@ -1409,7 +1418,7 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
-    ports: ["4001:4001"]
+    ports: ["127.0.0.1:4001:4001"]
     # /__health, not /health — the router serves user sites on wildcard
     # subdomains, so a bare /health would collide with a deployed site's own.
     healthcheck:
@@ -1420,7 +1429,7 @@ services:
   web:
     build: { context: ../apps/web }
     command: ["pnpm", "dev"]
-    ports: ["5173:5173"]
+    ports: ["127.0.0.1:5173:5173"]
 
   caddy:
     image: caddy:2
@@ -1433,9 +1442,13 @@ services:
 networks:
   default: {}
   build_egress:
-    # Builder containers join only this network: they can reach the internet
-    # but not postgres/redis/minio, which live on `default`.
+    # The only network build containers join. `internal`: no route anywhere;
+    # the one way out is build-proxy.
     name: shipyard_build_egress
+    driver: bridge
+    internal: true
+  proxy_out:
+    # build-proxy's route to the internet. Nothing else joins it.
     driver: bridge
 
 volumes:
@@ -1443,6 +1456,42 @@ volumes:
   redisdata: {}
   miniodata: {}
   caddydata: {}
+```
+
+`docker/build-proxy/squid.conf`: the egress filter for builds.
+
+```
+# Egress proxy for build containers: their only way out of the `build_egress`
+# network, which is `internal` (no route to the host, other containers, or the
+# internet). Builds may reach any public host (npm, GitHub, font CDNs), but
+# nothing private.
+#
+# Squid resolves each destination itself and checks the resulting IP, so a
+# public DNS name that points at a private address is refused too.
+
+http_port 3128
+
+# Loopback, private (including every Docker network and Docker Desktop's
+# host.docker.internal), carrier-grade NAT, link-local (the cloud metadata
+# endpoint, 169.254.169.254) and multicast.
+acl blocked_dst dst 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4
+acl blocked_dst dst ::1 fc00::/7 fe80::/10
+
+acl Safe_ports port 80 443
+acl SSL_ports port 443
+acl CONNECT method CONNECT
+
+http_access deny !Safe_ports
+http_access deny CONNECT !SSL_ports
+http_access deny blocked_dst
+# Only build containers can reach this port (see docker/compose.yaml).
+http_access allow all
+
+# A filter, not a cache: dependency caching is Phase 4's cache volume.
+cache deny all
+# Logs stay in /var/log/squid (squid runs as `proxy`, which can't open the
+# container's stdout). Denied requests: docker compose exec build-proxy
+# grep DENIED /var/log/squid/access.log
 ```
 
 `docker/Caddyfile` (development)
