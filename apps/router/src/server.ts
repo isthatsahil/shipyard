@@ -1,4 +1,10 @@
-import app from "./index.js";
-import { env } from "./lib/clients.js";
+import { createApp } from "./index.js";
 
-app.listen(env.PORT, () => console.log(`router listening on ${env.PORT}`));
+import { env, log, storage } from "./lib/clients.js";
+import { resolveHost } from "./resolve.js";
+
+createApp({
+  store: storage,
+  resolve: resolveHost,
+  logLevel: env.LOG_LEVEL,
+}).listen(env.PORT, () => log.info(`router listening on ${env.PORT}`));

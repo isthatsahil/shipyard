@@ -13,7 +13,8 @@
     "build": "tsdown",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --passWithNoTests"
+    "test": "vitest run --passWithNoTests --dir src",
+    "test:e2e": "vitest run --dir test"
   },
   "dependencies": {
     "bullmq": "^6.3.8",
@@ -22,7 +23,8 @@
     "ioredis": "^6.0.0",
     "p-limit": "^7.3.3",
     "pino": "^10.3.1",
-    "simple-git": "^3.36.0"
+    "simple-git": "^3.36.0",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@shipyard/db": "workspace:*",

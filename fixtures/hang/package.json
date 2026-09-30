@@ -1,0 +1,9 @@
+{
+  "name": "hang",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "postinstall": "while true; do sleep 1; done",
+    "build": "echo unreachable: postinstall never finishes"
+  }
+}

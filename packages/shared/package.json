@@ -6,12 +6,17 @@
   "type": "module",
   "exports": {
     "./env": "./src/env.ts",
+    "./constants": "./src/constants.ts",
     "./storage": "./src/storage.ts",
+    "./storageKeys": "./src/storageKeys.ts",
     "./redis": "./src/redis.ts",
     "./queue": "./src/queue.ts",
     "./slug": "./src/slug.ts",
     "./contentType": "./src/contentType.ts",
-    "./errors": "./src/errors.ts"
+    "./errors": "./src/errors.ts",
+    "./messages": "./src/messages.ts",
+    "./logger": "./src/logger.ts",
+    "./testing": "./src/testing/memoryStorage.ts"
   },
   "license": "MIT",
   "scripts": {
@@ -23,9 +28,11 @@
     "bullmq": "^6.3.8",
     "ioredis": "^6.0.0",
     "mime-types": "^3.0.2",
+    "pino": "^10.3.1",
     "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@types/mime-types": "^3.0.1"
+    "@types/mime-types": "^3.0.1",
+    "pino-pretty": "^13.1.3"
   }
 }

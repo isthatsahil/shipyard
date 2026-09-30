@@ -1,0 +1,37 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm db:generate && pnpm typecheck && pnpm lint && pnpm test
+  e2e:
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm builder:build
+      - run: cp .env.example .env && cp docker/.env.example docker/.env && pnpm infra:up --build --wait
+        # Compose interpolates this into the worker's environment (see Step 7).
+        env: { BUILD_TIMEOUT_MS: 60000 }
+      # Migrate and seed from the runner, not inside the api container: the api
+      # image holds only the pruned production tree, with no pnpm or prisma.
+      - run: pnpm db:generate && pnpm --filter @shipyard/db migrate:deploy && pnpm db:seed
+      - run: docker compose -f docker/compose.yaml cp caddy:/data/caddy/pki/authorities/local/root.crt ./caddy-root.crt
+      - run: pnpm test:e2e
+        # Absolute: pnpm runs the suite from apps/worker, where a relative path wouldn't resolve.
+        env:
+          API_URL: http://localhost:4000
+          BASE_DOMAIN: localhost
+          NODE_EXTRA_CA_CERTS: ${{ github.workspace }}/caddy-root.crt
+      - if: failure()
+        run: docker compose -f docker/compose.yaml logs

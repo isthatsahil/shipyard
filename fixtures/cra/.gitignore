@@ -1,0 +1,8 @@
+node_modules
+dist
+build
+out
+public_html
+.svelte-kit
+.next
+next-env.d.ts

@@ -14,9 +14,10 @@ RUN apt-get update \
  # pnpm 12 fetches its native binary on first run; do it now so it lands in the image.
  && pnpm --version \
  && chmod -R a+rX "$COREPACK_HOME" \
- # The node image already has uid 1000 (`node`); rename it rather than add a second user.
- && groupmod -n builder node \
- && usermod -l builder -d /home/builder -m -s /bin/sh node \
+ # A dedicated uid, not the image's `node` (1000): on a Linux host 1000 is usually a
+ # real login account. Must match SANDBOX_UID in apps/worker/src/lib/constants.ts.
+ && groupadd -g 10001 builder \
+ && useradd -u 10001 -g builder -d /home/builder -m -s /bin/sh builder \
  && mkdir -p /app /cache && chown builder:builder /app /cache
 
 USER builder

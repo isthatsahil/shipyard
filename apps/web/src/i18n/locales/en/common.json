@@ -1,0 +1,12 @@
+{
+  "appName": "Shipyard",
+  "status.queued": "Queued",
+  "status.cloning": "Cloning",
+  "status.detecting": "Detecting",
+  "status.building": "Building",
+  "status.uploading": "Uploading",
+  "status.ready": "Ready",
+  "status.failed": "Failed",
+  "status.cancelled": "Cancelled",
+  "status.archived": "Archived"
+}
