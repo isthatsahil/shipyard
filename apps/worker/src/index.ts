@@ -45,6 +45,7 @@ const shutdown = async () => {
   await worker.close();
   process.exit(0);
 };
+
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 log.info({ concurrency: env.BUILD_CONCURRENCY }, "worker ready");

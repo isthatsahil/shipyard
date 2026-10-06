@@ -1,6 +1,6 @@
 import Docker from "dockerode";
-import pino from "pino";
 import { loadEnv } from "@shipyard/shared/env";
+import { createLogger } from "@shipyard/shared/logger";
 import { Storage, type ObjectStore } from "@shipyard/shared/storage";
 import { createRedis } from "@shipyard/shared/redis";
 import { z } from "zod";
@@ -29,8 +29,12 @@ export const env = loadEnv({
   BUILDER_IMAGE_PREFIX: z.string().default("shipyard/builder:node"),
 });
 
-/** The worker's logger. For build output shown to users, use `BuildLogger`. */
-export const log = pino({ level: env.LOG_LEVEL });
+/**
+ * The worker's logger: tags every line `service: "worker"` and redacts
+ * tokens and env vars (see `createLogger`). For build output shown to users,
+ * use `BuildLogger`.
+ */
+export const log = createLogger("worker", env.LOG_LEVEL);
 /** Object storage that deployments are uploaded to. */
 export const storage: ObjectStore = new Storage(env);
 /** Shared Redis connection, for build logs, status events and the route cache. */

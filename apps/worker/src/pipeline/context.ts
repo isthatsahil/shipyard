@@ -1,6 +1,6 @@
 import type { Deployment, Project } from "@shipyard/db";
 import type { ObjectWriter } from "@shipyard/shared/storage";
-import type { DetectResult } from "../detect/index.js";
+import type { DetectResult } from "@shipyard/shared/detect";
 import type { BuildLogger } from "../lib/logs.js";
 
 /**

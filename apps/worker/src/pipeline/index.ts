@@ -8,7 +8,7 @@ import {
 } from "@shipyard/shared/errors";
 import { env, log, storage } from "../lib/clients.js";
 import { BuildLogger } from "../lib/logs.js";
-import { isInside, resolvesInside } from "../lib/paths.js";
+import { isInside, resolvesInside } from "@shipyard/shared/paths";
 import { setStatus } from "../lib/status.js";
 import type { BuildContext } from "./context.js";
 import { clone } from "./clone.js";
@@ -17,6 +17,7 @@ import { build } from "./build.js";
 import { resolveOutput } from "./resolveOutput.js";
 import { upload } from "./upload.js";
 import { promote } from "./promote.js";
+import { logsKey } from "@shipyard/shared/storageKeys";
 
 /**
  * Runs one deployment's build: clone → detect → build → find output → upload
@@ -96,6 +97,13 @@ export async function runPipeline(deploymentId: string, signal: AbortSignal) {
       finishedAt: new Date(),
     }).catch(() => {});
   } finally {
+    const all = await logger.all();
+    await storage
+      .put(logsKey(deployment.storagePrefix), Buffer.from(all.join("\n")), {
+        contentType: "text/plain",
+      })
+      .catch(() => {});
+
     await logger.flush();
     await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
   }

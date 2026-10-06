@@ -128,7 +128,7 @@ job {deploymentId}
   ├─ 5. status=uploading; walk output dir → deployments/<id>/<path> with correct
   │      Content-Type; immutable cache headers for hashed assets, no-cache for
   │      index.html; pre-compress .br/.gz variants
-  ├─ 6. status=ready; set projects.active_deployment_id; DEL route:<slug>;
+  ├─ 6. status=ready; set projects.active_deployment_id; DEL route:v2:<slug>;
   │      persist final log to deployments/<id>/_logs.txt
   └─ on failure: status=failed + error, keep logs, clean temp dir
 ```
@@ -145,10 +145,12 @@ job {deploymentId}
 GET https://myapp.yourdomain.app/settings/profile
 
 1. Extract host → "myapp". If it looks like a deployment id → preview mode.
-2. Resolve: Redis GET route:myapp → deploymentId (fallback Postgres, cache 60s).
+2. Resolve: Redis GET route:v2:myapp → { deploymentId, storagePrefix, spaFallback }
+   (fallback Postgres, cache 60s).
 3. Normalise path: "/" → "/index.html"; "/docs/" → "/docs/index.html";
    reject any ".." after normalisation.
-4. Fetch deployments/<id>/<path>
+4. Fetch <storagePrefix><path>, using the prefix saved on the deployment row
+   (deployments/<id>/ today; never rebuilt from the id)
      → 404, no file extension, spa_fallback on → serve /index.html
      → 404 otherwise → /404.html if present, else generic 404
 5. Stream object; set Content-Type, ETag, Cache-Control, Content-Encoding
@@ -206,7 +208,8 @@ Redis holds only ephemeral state:
 ```
 bull:builds:*      BullMQ queue
 logs:<id>          list + pub/sub channel, EXPIRE 24h
-route:<slug>       → deploymentId, TTL 60s
+route:v2:<slug>    → { deploymentId, storagePrefix, spaFallback }, TTL 60s
+                     (v2 = version of the cached JSON's shape; bump it when it changes)
 ```
 
 Slugs: validated `[a-z0-9-]{3,40}`, reserved list (`api`, `www`, `admin`, …).

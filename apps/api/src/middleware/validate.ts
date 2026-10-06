@@ -17,7 +17,10 @@ type Source = "body" | "query" | "params";
  * projects.get("/:id/deployments", validate(Page, "query"), handler);
  */
 export const validate =
-  (schema: z.ZodType, source: Source = "body"): RequestHandler =>
+  <P = Parameters<RequestHandler>[0]["params"]>(
+    schema: z.ZodType,
+    source: Source = "body",
+  ): RequestHandler<P> =>
   (req, _res, next) => {
     const result = schema.safeParse(req[source]);
     if (!result.success) return next(result.error);

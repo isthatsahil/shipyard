@@ -169,6 +169,8 @@ How it matches S3:
 - **`get` builds a new `Readable` on every call.** A stream can only be read once, so returning a stored stream would break the second request for the same file.
 - **`objects` is public** so a test can check what was written (for example, that an upload skipped `.env`) without going through `list`.
 
+The fake has its own tests, in `packages/shared/src/tests/MemoryStorage.test.ts`, which check each of these points.
+
 ```ts
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
@@ -232,7 +234,7 @@ export const keys = {
   logs: (deploymentId: string) => `logs:${deploymentId}`,          // list + pub/sub channel
   status: (deploymentId: string) => `status:${deploymentId}`,      // pub/sub channel
   cancel: (deploymentId: string) => `cancel:${deploymentId}`,      // pub/sub channel (Phase 4)
-  route: (slug: string) => `route:${slug}`,                        // router cache
+  route: (slug: string) => `route:v2:${slug}`,                     // router cache; v2 = shape of the cached Target
   routeHost: (hostname: string) => `route:host:${hostname}`,       // router cache, custom domains (Phase 5)
   session: (id: string) => `session:${id}`,                        // session id → user id (Phase 3)
 } as const satisfies Record<string, (id: string) => string>;
@@ -253,6 +255,8 @@ Why two kinds of connection:
 - **Retries differ by use.** `maxRetriesPerRequest: 3` means a normal command fails after three reconnect attempts, so an API request errors quickly when Redis is down instead of hanging. A subscriber has nothing to fail back to, so `null` keeps it retrying until Redis returns.
 
 `keys` is the only place key names are spelled out. The worker publishes to `keys.logs(id)` and the API subscribes to `keys.logs(id)`, so the two can't drift apart. `as const satisfies Record<…>` checks that every entry is a `(id) => string` function while keeping the exact property names, so `keys.logz` is a compile error.
+
+The router cache key carries a version, `route:v2:`, because the router trusts the JSON it caches as-is (see `resolve.ts` in Step 5). Bump it whenever the router's `Target` changes shape.
 
 ### `packages/shared/src/constants.ts`
 
@@ -1133,8 +1137,8 @@ Each step takes a shared `BuildContext`, reads what earlier steps left there and
 
 ```ts
 import Docker from "dockerode";
-import pino from "pino";
 import { loadEnv } from "@shipyard/shared/env";
+import { createLogger } from "@shipyard/shared/logger";
 import { S3Storage, type ObjectStore } from "@shipyard/shared/storage";
 import { createRedis } from "@shipyard/shared/redis";
 import { z } from "zod";
@@ -1153,12 +1157,14 @@ export const env = loadEnv({
   BUILDER_IMAGE_PREFIX: z.string().default("shipyard/builder:node"),
 });
 
-export const log = pino({ level: env.LOG_LEVEL });
+export const log = createLogger("worker", env.LOG_LEVEL);
 export const storage: ObjectStore = new S3Storage(env);
 export const redis = createRedis(env.REDIS_URL);
 redis.on("error", err => log.error({ err }, "redis error"));   // without a listener ioredis console.errors every reconnect
 export const docker = new Docker({ socketPath: "/var/run/docker.sock" });
 ```
+
+`log` comes from the shared `createLogger`, as in the API and router, so worker lines carry `service: "worker"` and the same redaction of `gitToken`, `envVars` and `accessToken`. Build output shown to users goes through `BuildLogger` instead (below).
 
 The build limits are environment variables so CI can shorten the timeout (Step 7) and a larger machine can raise concurrency without code changes:
 
@@ -1927,7 +1933,7 @@ import { ROUTE_TTL_SECONDS } from "@shipyard/shared/constants";
 import { isValidSlug, DEPLOYMENT_ID_RE } from "@shipyard/shared/slug";
 import { redis, env, log } from "./lib/clients.js";
 
-export interface Target { deploymentId: string; spaFallback: boolean }
+export interface Target { deploymentId: string; storagePrefix: string; spaFallback: boolean }
 export type Resolver = (hostname: string) => Promise<Target | null>;
 
 /** Any failure (Redis down, a corrupted value) is logged and treated as a miss. */
@@ -1958,17 +1964,26 @@ export async function resolveHost(hostname: string): Promise<Target | null> {
 
   // Preview mode: <deploymentId>.<base>. isValidSlug rejects id-shaped labels, so this can't shadow a slug.
   if (DEPLOYMENT_ID_RE.test(label)) {
-    const deployment = await prisma.deployment.findUnique({ where: { id: label }, select: { status: true, project: { select: { spaFallback: true } } } });
-    return deployment?.status === "ready" ? { deploymentId: label, spaFallback: deployment.project.spaFallback } : null;
+    const deployment = await prisma.deployment.findUnique({ where: { id: label }, select: { status: true, storagePrefix: true, project: { select: { spaFallback: true } } } });
+    return deployment?.status === "ready"
+      ? { deploymentId: label, storagePrefix: deployment.storagePrefix, spaFallback: deployment.project.spaFallback }
+      : null;
   }
 
   if (!isValidSlug(label)) return null;
   const cached = await readCachedRoute(label);
   if (cached) return cached;
 
-  const project = await prisma.project.findUnique({ where: { slug: label }, select: { activeDeploymentId: true, spaFallback: true } });
-  if (!project?.activeDeploymentId) return null;
-  const target: Target = { deploymentId: project.activeDeploymentId, spaFallback: project.spaFallback };
+  const project = await prisma.project.findUnique({
+    where: { slug: label },
+    select: { spaFallback: true, activeDeployment: { select: { id: true, storagePrefix: true } } },
+  });
+  if (!project?.activeDeployment) return null;
+  const target: Target = {
+    deploymentId: project.activeDeployment.id,
+    storagePrefix: project.activeDeployment.storagePrefix,
+    spaFallback: project.spaFallback,
+  };
   await cacheRoute(label, target);
   return target;
 }
@@ -1976,15 +1991,16 @@ export async function resolveHost(hostname: string): Promise<Target | null> {
 
 - **Only direct subdomains of `BASE_DOMAIN`.** `site.localhost` is looked up; `a.b.localhost` and other domains return `null`. Custom domains are added in Phase 5.
 - **Preview URLs.** A label shaped like a deployment id (`DEPLOYMENT_ID_RE`) serves that exact deployment, so any `ready` build can be viewed at its own URL even when it isn't live. This runs before the slug lookup and never falls through to it: `isValidSlug` rejects every id-shaped label, so no project can have that slug (see `slug.ts`). Preview lookups aren't cached: they're rare, and caching them would need its own invalidation.
-- **Production URLs** look up the project by slug and serve its `activeDeploymentId`. The label is checked with `isValidSlug` first, so random hostnames don't reach the database.
+- **Production URLs** look up the project by slug and serve its live deployment (`activeDeployment`). The label is checked with `isValidSlug` first, so random hostnames don't reach the database.
 - **Cache-aside in Redis.** Every request needs this lookup, so the answer is cached for `ROUTE_TTL_SECONDS`. Promote deletes the entry, so a new deploy shows up on the next request, not after the TTL. Misses (`null`) aren't cached, so a site becomes reachable the moment its first deployment is promoted.
-- **The cached value is the whole `Target`** (deployment id and SPA setting), so a cache hit needs no database query.
-- **Redis failures never fail a request; Postgres failures do.** Redis is only a cache here, so `readCachedRoute` turns any read error into a miss and `cacheRoute` logs and ignores a failed write. If Redis goes down, every site stays up and each lookup goes to Postgres instead, slower and with more database load, and the `route cache … failed` warnings in the logs say why. A corrupted value under `route:<slug>` is handled the same way, so it can't break one site until it expires. Postgres errors propagate on purpose: without the database there's no way to know what to serve, so `createApp`'s `catch` passes them to Express and the request gets a 500.
+- **The cached value is the whole `Target`** (deployment id, storage prefix and SPA setting), so a cache hit needs no database query.
+- **The storage prefix comes from the row.** Both lookups read the deployment's saved `storagePrefix` instead of rebuilding it with `deploymentPrefix(id)`. The column exists so the storage layout can change without breaking old deployments, and a router that rebuilt the prefix from the id would undo that.
+- **Redis failures never fail a request; Postgres failures do.** Redis is only a cache here, so `readCachedRoute` turns any read error into a miss and `cacheRoute` logs and ignores a failed write. If Redis goes down, every site stays up and each lookup goes to Postgres instead, slower and with more database load, and the `route cache … failed` warnings in the logs say why. A corrupted value under `route:v2:<slug>` is handled the same way, so it can't break one site until it expires. Postgres errors propagate on purpose: without the database there's no way to know what to serve, so `createApp`'s `catch` passes them to Express and the request gets a 500.
 
 Two trade-offs are deliberate, and worth knowing before you change this file:
 
 - **Misses aren't cached, so unknown slugs always reach Postgres.** Caching `null` would make a brand-new site show "no deployment" until the cached miss expired, right when the user is checking whether it worked. The cost is that every request for a well-formed slug that doesn't exist (a bot scanning random subdomains, a typo) does a database query. It's a single lookup on the unique `slug` index, so it's cheap, and `isValidSlug` already stops malformed labels before this point. If that traffic ever shows up in the database load, cache misses for a few seconds (e.g. store `"null"` with `EX 5`): a new site would then take at most that long to appear.
-- **Cached values aren't validated.** A cache hit is returned as parsed, on the assumption that it has the current `Target` shape. That holds as long as the shape doesn't change. If you add a field to `Target`, entries written by the old code lack it until they expire (at most `ROUTE_TTL_SECONDS`) or a promote deletes them, and during a rolling deploy old and new routers write both shapes. Either make new fields optional with a sensible default where they're read, or change the key in `keys.route` (e.g. `route:v2:<slug>`) so old entries are simply never read.
+- **Cached values aren't validated.** A cache hit is returned as parsed, on the assumption that it has the current `Target` shape. That holds as long as the shape doesn't change. If you add a field to `Target`, entries written by the old code lack it until they expire (at most `ROUTE_TTL_SECONDS`) or a promote deletes them, and during a rolling deploy old and new routers write both shapes. Either make new fields optional with a sensible default where they're read, or change the key in `keys.route` so old entries are simply never read. Adding `storagePrefix` used the second option: the key changed from `route:<slug>` to `route:v2:<slug>`, and the next change to `Target` should make it `v3`.
 
 `resolve.ts` is the one router module that touches Prisma and Redis (through `./lib/clients.js`). Only `server.ts` imports it at runtime; `serve.ts` and `index.ts` use `import type`, which is erased at compile time, so tests can load them without a database.
 
@@ -1996,7 +2012,7 @@ Receives the store as an argument and never imports `./lib/clients.js`.
 import type { Request, Response } from "express";
 import posix from "node:path/posix";
 import type { ObjectReader } from "@shipyard/shared/storage";
-import { deploymentPrefix, INTERNAL_FILES } from "@shipyard/shared/storageKeys";
+import { INTERNAL_FILES } from "@shipyard/shared/storageKeys";
 import type { Target } from "./resolve.js";
 
 const NOT_FOUND = `<!doctype html><title>404</title><h1>404 — Not found</h1>`;
@@ -2038,7 +2054,7 @@ export async function serveDeployment(store: ObjectReader, target: Target, req: 
   if (rel === null) return res.status(400).type("text").send("Bad path");
   // Answered with 404, not 400, so their existence isn't revealed.
   if (INTERNAL_FILES.has(rel)) return res.status(404).type("html").send(NOT_FOUND);
-  const prefix = deploymentPrefix(target.deploymentId);
+  const prefix = target.storagePrefix;   // the row's saved prefix, never rebuilt from the id
 
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
@@ -2178,15 +2194,17 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createHash } from "node:crypto";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import { deploymentPrefix, metaKey } from "@shipyard/shared/storageKeys";
+import { metaKey } from "@shipyard/shared/storageKeys";
 import { MemoryStorage } from "@shipyard/shared/testing";
 import { createApp } from "../index.js";
 import { normalise } from "../serve.js";
 import type { Target } from "../resolve.js";
 
 const store = new MemoryStorage();
-const PREFIX = deploymentPrefix("d1");
-let target: Target | null = { deploymentId: "d1", spaFallback: true };
+// Deliberately not deploymentPrefix("d1"): the router must serve from the prefix in its Target.
+const PREFIX = "relocated/d1/";
+const LIVE: Target = { deploymentId: "d1", storagePrefix: PREFIX, spaFallback: true };
+let target: Target | null = LIVE;
 let server: http.Server;
 let port: number;
 
@@ -2237,11 +2255,11 @@ describe("serveDeployment", () => {
     expect(result.status).toBe(404); expect(result.body).not.toBe("home");
   });
   it("SPA off → custom 404.html with status 404", async () => {
-    target = { deploymentId: "d1", spaFallback: false };
+    target = { ...LIVE, spaFallback: false };
     try {
       const result = await get("/some/client/route");
       expect(result.status).toBe(404); expect(result.body).toBe("custom 404");
-    } finally { target = { deploymentId: "d1", spaFallback: true }; }
+    } finally { target = LIVE; }
   });
 
   it("hides internal files", async () => expect((await get("/_meta.json")).status).toBe(404));
@@ -2255,14 +2273,14 @@ describe("serveDeployment", () => {
     expect(result.status).toBe(304);
   });
   it("custom 404.html is never a 304 and has no ETag", async () => {
-    target = { deploymentId: "d1", spaFallback: false };
+    target = { ...LIVE, spaFallback: false };
     try {
       // MemoryStorage's ETag is the quoted MD5 of the content: send the one a browser would have cached.
       const cachedEtag = `"${createHash("md5").update("custom 404").digest("hex")}"`;
       const result = await get("/some/client/route", { "if-none-match": cachedEtag });
       expect(result.status).toBe(404);
       expect(result.headers.etag).toBeUndefined();
-    } finally { target = { deploymentId: "d1", spaFallback: true }; }
+    } finally { target = LIVE; }
   });
 
   it("unknown host → 404", async () => {
@@ -2292,6 +2310,7 @@ How the tests are set up:
 
 - **`beforeAll` fills the store** with one small deployment covering each lookup rule: a root `index.html`, `docs/index.html` (folder-style pretty URL), `about.html` (`.html`-style pretty URL), a custom `404.html`, a `_next/` asset, and `_meta.json` (which must stay hidden).
 - **The resolver is a variable.** `target` is what the fake `resolve` returns, so a test can switch SPA fallback off, or simulate an unknown host (`null`), then restore it in `finally` so later tests aren't affected.
+- **`PREFIX` is deliberately not `deploymentPrefix("d1")`.** The router must serve from the `storagePrefix` in its `Target`, so these tests fail if it ever rebuilds the prefix from the id.
 - **`listen(0)`** lets the OS pick a free port, so tests never collide with a running router or with each other.
 - **The `describe("normalise")` table** tests the path function on its own, including malformed encoding, which is hard to send through a real HTTP client.
 

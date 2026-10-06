@@ -2,10 +2,11 @@ import { describe, it, expect } from "vitest";
 import { PassThrough, Readable } from "node:stream";
 import type { Request, Response } from "express";
 import type { ObjectReader } from "@shipyard/shared/storage";
-import { deploymentPrefix } from "@shipyard/shared/storageKeys";
 import { serveDeployment } from "../serve";
 
-const PREFIX = deploymentPrefix("d1");
+// Deliberately not deploymentPrefix("d1"): the router must serve from the
+// prefix saved on the row, so these tests fail if it rebuilds one from the id.
+const PREFIX = "relocated/d1/";
 
 /** A store holding `files` (key relative to the deployment → body), each with ETag `"<key>"`. */
 function storeWith(files: Record<string, string>) {
@@ -63,7 +64,11 @@ function fakeResponse() {
 const request = (path: string, headers: Record<string, string> = {}) =>
   ({ path, headers }) as unknown as Request;
 
-const target = { deploymentId: "d1", spaFallback: false };
+const target = {
+  deploymentId: "d1",
+  storagePrefix: PREFIX,
+  spaFallback: false,
+};
 
 describe("serveDeployment revalidation", () => {
   it("answers 304 when If-None-Match matches, and releases the storage stream", async () => {
