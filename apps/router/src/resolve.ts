@@ -9,8 +9,14 @@ import { redis, env, log } from "./lib/clients.js";
 
 /** What the router serves for a hostname: one deployment's files. */
 export interface Target {
-  /** Deployment whose files are served, from `deployments/<id>/` in storage. */
+  /** Deployment whose files are served. */
   deploymentId: string;
+  /**
+   * The deployment's saved `storagePrefix`, under which its files are stored.
+   * Read from the row rather than rebuilt from the id, so a deployment stays
+   * servable if the storage layout changes.
+   */
+  storagePrefix: string;
   /** Serve `index.html` for extensionless paths with no matching file (client-side routes). */
   spaFallback: boolean;
 }
@@ -101,10 +107,18 @@ export async function resolveHost(hostname: string): Promise<Target | null> {
   if (DEPLOYMENT_ID_RE.test(label)) {
     const deployment = await prisma.deployment.findUnique({
       where: { id: label },
-      select: { status: true, project: { select: { spaFallback: true } } },
+      select: {
+        status: true,
+        storagePrefix: true,
+        project: { select: { spaFallback: true } },
+      },
     });
     return deployment?.status === "ready"
-      ? { deploymentId: label, spaFallback: deployment.project.spaFallback }
+      ? {
+          deploymentId: label,
+          storagePrefix: deployment.storagePrefix,
+          spaFallback: deployment.project.spaFallback,
+        }
       : null;
   }
 
@@ -114,12 +128,16 @@ export async function resolveHost(hostname: string): Promise<Target | null> {
 
   const project = await prisma.project.findUnique({
     where: { slug: label },
-    select: { activeDeploymentId: true, spaFallback: true },
+    select: {
+      spaFallback: true,
+      activeDeployment: { select: { id: true, storagePrefix: true } },
+    },
   });
   // Not cached: see "A `null` is not cached" above.
-  if (!project?.activeDeploymentId) return null;
+  if (!project?.activeDeployment) return null;
   const target: Target = {
-    deploymentId: project.activeDeploymentId,
+    deploymentId: project.activeDeployment.id,
+    storagePrefix: project.activeDeployment.storagePrefix,
     spaFallback: project.spaFallback,
   };
   await cacheRoute(label, target);

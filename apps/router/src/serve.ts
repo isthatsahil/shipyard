@@ -1,7 +1,7 @@
 import type { Request, Response } from "express";
 import posix from "node:path/posix";
 import type { ObjectReader } from "@shipyard/shared/storage";
-import { deploymentPrefix, INTERNAL_FILES } from "@shipyard/shared/storageKeys";
+import { INTERNAL_FILES } from "@shipyard/shared/storageKeys";
 import type { Target } from "./resolve.js";
 
 /** Fallback 404 page, for deployments that don't ship their own `404.html`. */
@@ -119,7 +119,7 @@ export async function serveDeployment(
   // Answered with 404, not 400, so their existence isn't revealed.
   if (INTERNAL_FILES.has(rel))
     return res.status(404).type("html").send(NOT_FOUND);
-  const prefix = deploymentPrefix(target.deploymentId);
+  const prefix = target.storagePrefix;
 
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");

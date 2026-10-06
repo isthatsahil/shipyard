@@ -2,8 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { OutputNotFoundError } from "@shipyard/shared/errors";
 import { prisma } from "@shipyard/db";
-import { postBuildScan } from "../detect/index.js";
-import { isInside, resolvesInside } from "../lib/paths.js";
+import { postBuildScan } from "@shipyard/shared/detect";
+import { isInside, resolvesInside } from "@shipyard/shared/paths";
 import type { BuildContext } from "./context.js";
 
 /**

@@ -16,6 +16,8 @@
     "./errors": "./src/errors.ts",
     "./messages": "./src/messages.ts",
     "./logger": "./src/logger.ts",
+    "./detect": "./src/detect/index.ts",
+    "./paths": "./src/paths.ts",
     "./testing": "./src/testing/memoryStorage.ts"
   },
   "license": "MIT",

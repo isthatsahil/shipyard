@@ -5,6 +5,8 @@ import { projects } from "./routes/projects.js";
 import { deployments } from "./routes/deployment.js";
 import { errorHandler, notFound } from "./middleware/errors.js";
 import { health } from "./routes/health.js";
+import { logs } from "./routes/logs.js";
+import { detect } from "./routes/detects.js";
 
 const app = express();
 app.use(pinoHttp({ logger: log }));
@@ -18,6 +20,8 @@ app.get("/health", health);
 
 app.use("/projects", projects);
 app.use("/deployments", deployments);
+app.use("/deployments", logs); // GET /deployments/:id/logs; no path overlaps the router above
+app.use("/detect", detect);
 
 // Order matters: notFound after every router, errorHandler last.
 app.use(notFound);

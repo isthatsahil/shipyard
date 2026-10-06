@@ -154,9 +154,16 @@ Extend `resolveHost` in `apps/router/src/resolve.ts`: when the hostname is not u
 ```ts
 const cached = await redis.get(keys.routeHost(hostname));
 if (cached) return JSON.parse(cached);
-const domain = await prisma.domain.findUnique({ where: { hostname, verified: true }, select: { project: { select: { activeDeploymentId: true, spaFallback: true } } } });
-if (!domain?.project.activeDeploymentId) return null;
-const target = { deploymentId: domain.project.activeDeploymentId, spaFallback: domain.project.spaFallback };
+const domain = await prisma.domain.findUnique({
+  where: { hostname, verified: true },
+  select: { project: { select: { spaFallback: true, activeDeployment: { select: { id: true, storagePrefix: true } } } } },
+});
+if (!domain?.project.activeDeployment) return null;
+const target: Target = {
+  deploymentId: domain.project.activeDeployment.id,
+  storagePrefix: domain.project.activeDeployment.storagePrefix,
+  spaFallback: domain.project.spaFallback,
+};
 await redis.set(keys.routeHost(hostname), JSON.stringify(target), "EX", ROUTE_TTL_SECONDS);
 return target;
 ```

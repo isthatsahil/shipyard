@@ -127,7 +127,9 @@ services:
   web:
     build: { context: .., dockerfile: apps/web/Dockerfile, target: dev }
     # Host edits hot-reload inside the container.
-    volumes: [../apps/web/src:/repo/apps/web/src]
+    volumes:
+      - ../apps/web/src:/repo/apps/web/src
+      - ../packages/shared/src:/repo/packages/shared/src
     ports: ["127.0.0.1:5173:5173"]
 
   caddy:

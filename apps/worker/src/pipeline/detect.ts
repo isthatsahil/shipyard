@@ -1,5 +1,5 @@
 import { prisma } from "@shipyard/db";
-import { detectFramework, snapshotDirs } from "../detect/index.js";
+import { detectFramework, snapshotDirs } from "@shipyard/shared/detect";
 import type { BuildContext } from "./context.js";
 
 /**

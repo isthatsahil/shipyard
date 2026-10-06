@@ -43,10 +43,23 @@ export const keys = {
   logs: (deploymentId: string) => `logs:${deploymentId}`,
   /** Pub/sub channel on which a deployment's status changes are published. */
   status: (deploymentId: string) => `status:${deploymentId}`,
+  /**
+   * Private pub/sub channel of one open log stream (one per SSE connection).
+   * The API publishes markers on it to line its subscription up with its
+   * replay; nothing else uses it.
+   */
+  logSync: (streamId: string) => `logsync:${streamId}`,
   /** Pub/sub channel the worker listens on to stop a running build. */
   cancel: (deploymentId: string) => `cancel:${deploymentId}`,
-  /** Router cache: JSON route target for a `<slug>.<BASE_DOMAIN>` host. */
-  route: (slug: string) => `route:${slug}`,
+  /**
+   * Router cache: JSON route target for a `<slug>.<BASE_DOMAIN>` host.
+   *
+   * The `v2` is the version of the cached JSON's shape (the router's
+   * `Target`), not of the slug. Bump it whenever `Target` changes: the router
+   * trusts cached values as-is, so the new code must not read entries in the
+   * old shape. v2 added `storagePrefix`.
+   */
+  route: (slug: string) => `route:v2:${slug}`,
   /** Router cache: JSON route target for a custom domain. */
   routeHost: (hostname: string) => `route:host:${hostname}`,
   /** Session id → user id, with a sliding expiry. */

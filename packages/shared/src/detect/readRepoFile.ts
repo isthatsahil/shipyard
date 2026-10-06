@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { isInside } from "../lib/paths.js";
+import { isInside } from "../paths.js";
 
 /** Far above any real package.json or framework config. */
 const MAX_BYTES = 1024 * 1024;
